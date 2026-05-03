@@ -7,6 +7,7 @@
 </p>
 
 <p align="center">
+  <a href="https://safishamsi.gumroad.com/l/qetvlo"><img src="https://img.shields.io/badge/Book-The%20Memory%20Layer-2ea44f?style=flat&logo=gitbook&logoColor=white" alt="The Memory Layer"/></a>
   <a href="https://github.com/safishamsi/graphify/actions/workflows/ci.yml"><img src="https://github.com/safishamsi/graphify/actions/workflows/ci.yml/badge.svg?branch=v4" alt="CI"/></a>
   <a href="https://pypi.org/project/graphifyy/"><img src="https://img.shields.io/pypi/v/graphifyy" alt="PyPI"/></a>
   <a href="https://pepy.tech/project/graphifyy"><img src="https://static.pepy.tech/badge/graphifyy" alt="Downloads"/></a>
@@ -20,9 +21,9 @@
   </a>
 </p>
 
-**An AI coding assistant skill.** Type `/graphify` in Claude Code, Codex, OpenCode, Cursor, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Aider, OpenClaw, Factory Droid, Trae, Hermes, Kiro, or Google Antigravity - it reads your files, builds a knowledge graph, and gives you back structure you didn't know was there. Understand a codebase faster. Find the "why" behind architectural decisions.
+**An AI coding assistant skill.** Type `/graphify` in Claude Code, Codex, OpenCode, Cursor, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat, Aider, OpenClaw, Factory Droid, Trae, Hermes, Kiro, Pi, or Google Antigravity - it reads your files, builds a knowledge graph, and gives you back structure you didn't know was there. Understand a codebase faster. Find the "why" behind architectural decisions.
 
-Fully multimodal. Drop in code, PDFs, markdown, screenshots, diagrams, whiteboard photos, images in other languages, or video and audio files - graphify extracts concepts and relationships from all of it and connects them into one graph. Videos are transcribed with Whisper using a domain-aware prompt derived from your corpus. 25 languages supported via tree-sitter AST (Python, JS, TS, Go, Rust, Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Lua, Zig, PowerShell, Elixir, Objective-C, Julia, Verilog, SystemVerilog, Vue, Svelte, Dart).
+Fully multimodal. Drop in code, PDFs, markdown, screenshots, diagrams, whiteboard photos, images in other languages, or video and audio files - graphify extracts concepts and relationships from all of it and connects them into one graph. Videos are transcribed with Whisper using a domain-aware prompt derived from your corpus. YAML/YML files (Kubernetes, Kustomize, Helm, config) are indexed for semantic extraction. SQL files are AST-extracted deterministically — tables, views, functions, foreign keys, and FROM/JOIN relationships map directly into the graph with no LLM needed. 25 languages supported via tree-sitter AST (Python, JS, TS, Go, Rust, Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Lua, Zig, PowerShell, Elixir, Objective-C, Julia, Verilog, SystemVerilog, Vue, Svelte, Dart).
 
 > Andrej Karpathy keeps a `/raw` folder where he drops papers, tweets, screenshots, and notes. graphify is the answer to that problem - 71.5x fewer tokens per query vs reading the raw files, persistent across sessions, honest about what it found vs guessed.
 
@@ -48,7 +49,7 @@ dist/
 *.generated.py
 ```
 
-Same syntax as `.gitignore`. You can keep a single `.graphifyignore` at your repo root — patterns work correctly even when graphify is run on a subfolder.
+Same syntax as `.gitignore` — including `!` negation patterns to re-include specific files. You can keep a single `.graphifyignore` at your repo root — patterns work correctly even when graphify is run on a subfolder. Discovery never crosses a VCS boundary (`.git`, `.hg`, etc.), so sibling projects in a shared workspace don't leak rules into each other. Without a VCS root, only the scan folder's own `.graphifyignore` applies. Inline comments are supported: `vendor/ # legacy deps`.
 
 ## How it works
 
@@ -60,7 +61,7 @@ Every relationship is tagged `EXTRACTED` (found directly in source), `INFERRED` 
 
 ## Install
 
-**Requires:** Python 3.10+ and one of: [Claude Code](https://claude.ai/code), [Codex](https://openai.com/codex), [OpenCode](https://opencode.ai), [Cursor](https://cursor.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli), [VS Code Copilot Chat](https://code.visualstudio.com/docs/copilot/overview), [Aider](https://aider.chat), [OpenClaw](https://openclaw.ai), [Factory Droid](https://factory.ai), [Trae](https://trae.ai), [Kiro](https://kiro.dev), Hermes, or [Google Antigravity](https://antigravity.google)
+**Requires:** Python 3.10+ and one of: [Claude Code](https://claude.ai/code), [Codex](https://openai.com/codex), [OpenCode](https://opencode.ai), [Cursor](https://cursor.com), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli), [VS Code Copilot Chat](https://code.visualstudio.com/docs/copilot/overview), [Aider](https://aider.chat), [OpenClaw](https://openclaw.ai), [Factory Droid](https://factory.ai), [Trae](https://trae.ai), [Kiro](https://kiro.dev), [Pi](https://pi.dev), Hermes, or [Google Antigravity](https://antigravity.google)
 
 ```bash
 # Recommended — works on Mac and Linux with no PATH setup needed
@@ -93,6 +94,7 @@ pip install graphifyy && graphify install
 | Gemini CLI | `graphify install --platform gemini` |
 | Hermes | `graphify install --platform hermes` |
 | Kiro IDE/CLI | `graphify kiro install` |
+| Pi coding agent | `graphify install --platform pi` |
 | Cursor | `graphify cursor install` |
 | Google Antigravity | `graphify antigravity install` |
 
@@ -126,6 +128,7 @@ After building a graph, run this once in your project:
 | Gemini CLI | `graphify gemini install` |
 | Hermes | `graphify hermes install` |
 | Kiro IDE/CLI | `graphify kiro install` |
+| Pi coding agent | `graphify pi install` |
 | Google Antigravity | `graphify antigravity install` |
 
 **Claude Code** does two things: writes a `CLAUDE.md` section telling Claude to read `graphify-out/GRAPH_REPORT.md` before answering architecture questions, and installs a **PreToolUse hook** (`settings.json`) that fires before every Glob and Grep call. If a knowledge graph exists, Claude sees: _"graphify: Knowledge graph exists. Read GRAPH_REPORT.md for god nodes and community structure before searching raw files."_ — so Claude navigates via the graph instead of grepping through every file.
@@ -139,6 +142,8 @@ After building a graph, run this once in your project:
 **Gemini CLI** copies the skill to `~/.gemini/skills/graphify/SKILL.md`, writes a `GEMINI.md` section, and installs a `BeforeTool` hook in `.gemini/settings.json` that fires before file-read tool calls — same always-on mechanism as Claude Code.
 
 **Aider, OpenClaw, Factory Droid, Trae, and Hermes** write the same rules to `AGENTS.md` in your project root and copy the skill to the platform's global skill directory. These platforms don't support tool hooks, so AGENTS.md is the always-on mechanism.
+
+**Pi coding agent** copies the skill to `~/.pi/agent/skills/graphify/SKILL.md`. Run `graphify pi install` to set it up.
 
 **Kiro IDE/CLI** writes the skill to `.kiro/skills/graphify/SKILL.md` (invoked via `/graphify`) and a steering file to `.kiro/steering/graphify.md` with `inclusion: always` — Kiro injects this into every conversation automatically, no hook needed.
 
@@ -164,8 +169,16 @@ Think of it this way: the always-on hook gives your assistant a map. The `/graph
 
 **Recommended `.gitignore` additions:**
 ```
-# commit graph outputs, ignore the extraction cache
+# keep graph outputs, skip heavy/local-only files
+
+# optional: commit for shared extraction speed, skip to keep repo small
 graphify-out/cache/
+
+# mtime-based, invalid after git clone - always gitignore this
+graphify-out/manifest.json
+
+# local token tracking, not useful to share
+graphify-out/cost.json
 ```
 
 **Shared setup:**
@@ -175,6 +188,16 @@ graphify-out/cache/
 4. For doc/paper changes, whoever edits the files runs `/graphify --update` to refresh semantic nodes.
 
 **Excluding paths** — create `.graphifyignore` in your project root (same syntax as `.gitignore`). Files matching those patterns are skipped during detection and extraction.
+
+```
+# .graphifyignore example
+AGENTS.md          # graphify install files — don't extract your own instructions as knowledge
+CLAUDE.md
+GEMINI.md
+.gemini/
+.opencode/
+docs/translations/ # generated content you don't want in the graph
+```
 
 ## Using `graph.json` with an LLM
 
@@ -315,8 +338,17 @@ graphify explain "SwinTransformer"           # plain-language explanation of a n
 graphify add https://arxiv.org/abs/1706.03762          # fetch paper, save to ./raw, update graph
 graphify add https://... --author "Name" --contributor "Name"
 
+# clone any GitHub repo and run the full pipeline on it
+graphify clone https://github.com/karpathy/nanoGPT    # clones to ~/.graphify/repos/karpathy/nanoGPT
+graphify clone https://github.com/org/repo --branch dev --out ./my-clone
+
+# cross-repo graphs — merge two or more graph.json outputs into one
+graphify merge-graphs repo1/graphify-out/graph.json repo2/graphify-out/graph.json
+graphify merge-graphs g1.json g2.json g3.json --out cross-repo.json
+
 # incremental update and maintenance
 graphify watch ./src                         # auto-rebuild on code changes
+graphify check-update ./src                  # check if semantic re-extraction is pending (cron-safe)
 graphify update ./src                        # re-extract code files, no LLM needed
 graphify cluster-only ./my-project           # rerun clustering on existing graph.json
 ```
@@ -325,8 +357,8 @@ Works with any mix of file types:
 
 | Type | Extensions | Extraction |
 |------|-----------|------------|
-| Code | `.py .ts .js .jsx .tsx .mjs .go .rs .java .c .cpp .rb .cs .kt .scala .php .swift .lua .zig .ps1 .ex .exs .m .mm .jl .vue .svelte` | AST via tree-sitter + call-graph (cross-file for all languages) + docstring/comment rationale |
-| Docs | `.md .mdx .html .txt .rst` | Concepts + relationships + design rationale via Claude |
+| Code | `.py .ts .js .jsx .tsx .mjs .go .rs .java .c .cpp .rb .cs .kt .scala .php .swift .lua .zig .ps1 .ex .exs .m .mm .jl .vue .svelte .sql` | AST via tree-sitter + call-graph (cross-file for all languages) + Java extends/implements + docstring/comment rationale. SQL: tables, views, functions, foreign keys, FROM/JOIN edges (requires `pip install graphifyy[sql]`) |
+| Docs | `.md .mdx .html .txt .rst .yaml .yml` | Concepts + relationships + design rationale via Claude |
 | Office | `.docx .xlsx` | Converted to markdown then extracted via Claude (requires `pip install graphifyy[office]`) |
 | Papers | `.pdf` | Citation mining + concept extraction |
 | Images | `.png .jpg .webp .gif` | Claude vision - screenshots, diagrams, any language |
@@ -358,6 +390,8 @@ For better accuracy on technical content, use a larger model:
 
 Audio never leaves your machine. All transcription runs locally.
 
+> **Legal notice:** Only use `/graphify add <url>` to download content you have the rights to. graphify uses yt-dlp for audio extraction — the same terms of service and copyright rules apply.
+
 ## What you get
 
 **God nodes** - highest-degree concepts (what everything connects through)
@@ -378,7 +412,7 @@ Audio never leaves your machine. All transcription runs locally.
 
 **Auto-sync** (`--watch`) - run in a background terminal and the graph updates itself as your codebase changes. Code file saves trigger an instant rebuild (AST only, no LLM). Doc/image changes notify you to run `--update` for the LLM re-pass.
 
-**Git hooks** (`graphify hook install`) - installs post-commit and post-checkout hooks. Graph rebuilds automatically after every commit and every branch switch. If a rebuild fails, the hook exits with a non-zero code so git surfaces the error instead of silently continuing. No background process needed.
+**Git hooks** (`graphify hook install`) - installs post-commit and post-checkout hooks. Graph rebuilds automatically after every commit and every branch switch. Rebuilds run detached in the background so `git commit` returns instantly — log written to `~/.cache/graphify-rebuild.log` (`tail -f` for status).
 
 **Wiki** (`--wiki`) - Wikipedia-style markdown articles per community and god node, with an `index.md` entry point. Point any agent at `index.md` and it can navigate the knowledge base by reading files instead of parsing JSON.
 
@@ -395,6 +429,14 @@ Token reduction scales with corpus size. 6 files fits in a context window anyway
 ## Privacy
 
 graphify sends file contents to your AI coding assistant's underlying model API for semantic extraction of docs, papers, and images — Anthropic (Claude Code), OpenAI (Codex), or whichever provider your platform uses. Code files are processed locally via tree-sitter AST — no file contents leave your machine for code. Video and audio files are transcribed locally with faster-whisper — audio never leaves your machine. No telemetry, usage tracking, or analytics of any kind. The only network calls are to your platform's model API during extraction, using your own API key.
+
+## Optional integrations
+
+Runbooks for setting up extra tooling alongside graphify. None of these are required.
+
+| Integration | Doc |
+|---|---|
+| Docker MCP Toolkit + SQLite MCP server (lightweight persistent SQL workspace exposed to any MCP client) | [`docs/docker-mcp-sqlite.md`](docs/docker-mcp-sqlite.md) |
 
 ## Tech stack
 
