@@ -911,6 +911,24 @@ _TS_CONFIG = LanguageConfig(
     import_handler=_import_js,
 )
 
+# .tsx files must use the TSX grammar (JSX-aware), not the plain TypeScript grammar.
+# tree-sitter-typescript ships two languages: language_typescript (for .ts) and
+# language_tsx (for .tsx). Parsing .tsx with language_typescript silently fails on
+# JSX expressions, dropping any call_expression nested inside JSX (e.g. {fmtDate(x)}).
+_TSX_CONFIG = LanguageConfig(
+    ts_module="tree_sitter_typescript",
+    ts_language_fn="language_tsx",
+    class_types=_TS_CONFIG.class_types,
+    function_types=_TS_CONFIG.function_types,
+    import_types=_TS_CONFIG.import_types,
+    call_types=_TS_CONFIG.call_types,
+    call_function_field=_TS_CONFIG.call_function_field,
+    call_accessor_node_types=_TS_CONFIG.call_accessor_node_types,
+    call_accessor_field=_TS_CONFIG.call_accessor_field,
+    function_boundary_types=_TS_CONFIG.function_boundary_types,
+    import_handler=_TS_CONFIG.import_handler,
+)
+
 _JAVA_CONFIG = LanguageConfig(
     ts_module="tree_sitter_java",
     class_types=frozenset({"class_declaration", "interface_declaration"}),
@@ -1951,7 +1969,12 @@ def extract_python(path: Path) -> dict:
 
 def extract_js(path: Path) -> dict:
     """Extract classes, functions, arrow functions, and imports from a .js/.ts/.tsx file."""
-    config = _TS_CONFIG if path.suffix in (".ts", ".tsx") else _JS_CONFIG
+    if path.suffix == ".tsx":
+        config = _TSX_CONFIG
+    elif path.suffix == ".ts":
+        config = _TS_CONFIG
+    else:
+        config = _JS_CONFIG
     return _extract_generic(path, config)
 
 
@@ -2816,6 +2839,13 @@ def _cpp_preprocess(path: Path) -> bytes:
     Falls back to raw file bytes if cpp is not available. Capital-F extensions
     conventionally require C preprocessor expansion (#ifdef MPI, #define REAL8, etc.)
     before parsing.
+
+    Security (F-007): we pass `-nostdinc` and `-I /dev/null` so a malicious
+    source file containing `#include "/home/victim/.ssh/id_rsa"` (or any other
+    include directive) cannot inline arbitrary host files into the output that
+    we then ship to an LLM. Without these flags `cpp` happily resolves any
+    relative or absolute include path it can read, which is a corpus-side
+    file-exfiltration vector.
     """
     import shutil
     import subprocess
@@ -2823,7 +2853,7 @@ def _cpp_preprocess(path: Path) -> bytes:
         return path.read_bytes()
     try:
         result = subprocess.run(
-            ["cpp", "-w", "-P", str(path)],
+            ["cpp", "-w", "-P", "-nostdinc", "-I", "/dev/null", str(path)],
             capture_output=True,
             timeout=30,
         )
