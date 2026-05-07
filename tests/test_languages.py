@@ -1,11 +1,12 @@
-"""Tests for language extractors: Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Go, Julia, JS/TS."""
+"""Tests for language extractors: Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Go, Julia, Fortran, JS/TS."""
 from __future__ import annotations
 from pathlib import Path
 import pytest
 from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
-    extract_swift, extract_go, extract_julia, extract_js,
+    extract_swift, extract_go, extract_julia, extract_js, extract_fortran,
+    extract_groovy,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -721,6 +722,75 @@ def test_julia_no_dangling_edges():
         assert e["source"] in node_ids, f"Dangling source: {e}"
 
 
+# ── Fortran extractor ────────────────────────────────────────────────────────
+
+def test_fortran_finds_module():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    assert "error" not in r
+    labels = [n["label"] for n in r["nodes"]]
+    assert "geometry" in labels
+
+
+def test_fortran_finds_subroutines():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    labels = [n["label"] for n in r["nodes"]]
+    assert any("circle_area" in l for l in labels)
+    assert any("print_area" in l for l in labels)
+
+
+def test_fortran_finds_function():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    labels = [n["label"] for n in r["nodes"]]
+    assert any("distance" in l for l in labels)
+
+
+def test_fortran_finds_program():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    labels = [n["label"] for n in r["nodes"]]
+    assert "main" in labels
+
+
+def test_fortran_finds_use_imports():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    import_edges = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert len(import_edges) >= 2
+
+
+def test_fortran_use_edges_have_use_context():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    import_edges = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert all(e.get("context") == "use" for e in import_edges)
+
+
+def test_fortran_finds_calls():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    call_edges = [e for e in r["edges"] if e["relation"] == "calls"]
+    assert len(call_edges) >= 1
+
+
+def test_fortran_case_insensitive_names():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    labels = [n["label"] for n in r["nodes"]]
+    assert all(l == l.lower() or "(" in l for l in labels if l.endswith(("()", "")) and not "." in l)
+    assert "geometry" in labels
+    assert "main" in labels
+
+
+def test_fortran_no_dangling_edges():
+    r = extract_fortran(FIXTURES / "sample.f90")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source: {e}"
+
+
+def test_fortran_capital_F_parses_preprocessed():
+    r = extract_fortran(FIXTURES / "sample.F90")
+    assert "error" not in r
+    labels = [n["label"] for n in r["nodes"]]
+    assert "shapes" in labels
+    assert any("compute_volume" in l for l in labels)
+
+
 # ── TypeScript dynamic imports ───────────────────────────────────────────────
 
 def test_ts_dynamic_import_no_error():
@@ -784,3 +854,113 @@ def test_ts_static_template_literal_resolved():
     targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
     assert any("statichelper" in t.lower() for t in targets), \
         f"Static template literal import not resolved: {targets}"
+
+
+# ── Markdown ─────────────────────────────────────────────────────────────────
+
+from graphify.extract import extract_markdown
+
+def test_markdown_no_error():
+    r = extract_markdown(FIXTURES / "deploy_guide.md")
+    assert "error" not in r
+
+def test_markdown_finds_headings():
+    r = extract_markdown(FIXTURES / "deploy_guide.md")
+    labels = _labels(r)
+    assert any("Deploy Guide" in l for l in labels)
+    assert any("Prerequisites" in l for l in labels)
+    assert any("Full Deploy" in l for l in labels)
+    assert any("Rollback" in l for l in labels)
+
+def test_markdown_finds_nested_heading():
+    """### Database Migration is nested under ## Full Deploy."""
+    r = extract_markdown(FIXTURES / "deploy_guide.md")
+    labels = _labels(r)
+    assert any("Database Migration" in l for l in labels)
+
+def test_markdown_finds_code_blocks():
+    r = extract_markdown(FIXTURES / "deploy_guide.md")
+    labels = _labels(r)
+    assert any("code:bash" in l for l in labels)
+    assert any("code:sql" in l for l in labels)
+    assert any("code:python" in l for l in labels)
+
+def test_markdown_contains_edges():
+    """Headings and code blocks should be connected via 'contains' edges."""
+    r = extract_markdown(FIXTURES / "deploy_guide.md")
+    assert "contains" in _relations(r)
+    contains_edges = [e for e in r["edges"] if e["relation"] == "contains"]
+    assert len(contains_edges) >= 5  # file->h1, h1->h2s, h2->h3, h2->codeblocks
+
+def test_markdown_no_dangling_edges():
+    r = extract_markdown(FIXTURES / "deploy_guide.md")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source: {e}"
+
+
+# ── Groovy ───────────────────────────────────────────────────────────────────
+
+
+def test_groovy_no_error():
+    r = extract_groovy(FIXTURES / "sample.groovy")
+    assert "error" not in r
+
+
+def test_groovy_finds_class():
+    r = extract_groovy(FIXTURES / "sample.groovy")
+    assert any("SampleService" in l for l in _labels(r))
+
+
+def test_groovy_finds_methods():
+    r = extract_groovy(FIXTURES / "sample.groovy")
+    labels = _labels(r)
+    assert any("process" in l for l in labels)
+    assert any("reset" in l for l in labels)
+
+
+def test_groovy_finds_imports():
+    r = extract_groovy(FIXTURES / "sample.groovy")
+    assert "imports" in _relations(r)
+
+
+def test_groovy_import_edges_have_import_context():
+    r = extract_groovy(FIXTURES / "sample.groovy")
+    import_edges = _edges_with_relation(r, "imports", "imports_from")
+    assert import_edges
+    assert all(e.get("context") == "import" for e in import_edges)
+
+
+def test_groovy_no_dangling_edges():
+    r = extract_groovy(FIXTURES / "sample.groovy")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids
+
+
+def test_groovy_spock_finds_class():
+    r = extract_groovy(FIXTURES / "sample_spock.groovy")
+    assert any("SampleSpec" in l for l in _labels(r))
+
+
+def test_groovy_spock_finds_feature_methods():
+    r = extract_groovy(FIXTURES / "sample_spock.groovy")
+    feature_labels = [l for l in _labels(r) if l.startswith('"')]
+    assert len(feature_labels) >= 2
+
+
+def test_groovy_spock_finds_method_with_apostrophe():
+    r = extract_groovy(FIXTURES / "sample_spock.groovy")
+    assert any("it's" in l for l in _labels(r))
+
+
+def test_groovy_spock_preserves_import_edges():
+    r = extract_groovy(FIXTURES / "sample_spock.groovy")
+    assert "imports" in _relations(r)
+
+
+def test_groovy_spock_no_dangling_edges():
+    r = extract_groovy(FIXTURES / "sample_spock.groovy")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids

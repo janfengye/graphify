@@ -1,5 +1,6 @@
-# Direct LLM backend for semantic extraction — supports Claude and Kimi K2.6.
-# Used by `graphify . --backend kimi` and the benchmark scripts.
+# Direct LLM backend for semantic extraction — supports Claude, Kimi K2.6,
+# Gemini, and OpenAI.
+# Used by `graphify extract . --backend gemini` and the benchmark scripts.
 # The default graphify pipeline uses Claude Code subagents via skill.md;
 # this module provides a direct API path for non-Claude-Code environments.
 from __future__ import annotations
@@ -50,6 +51,7 @@ BACKENDS: dict[str, dict] = {
         "env_key": "ANTHROPIC_API_KEY",
         "pricing": {"input": 3.0, "output": 15.0},  # USD per 1M tokens
         "temperature": 0,
+        "max_tokens": 16384,
     },
     "kimi": {
         "base_url": "https://api.moonshot.ai/v1",
@@ -57,8 +59,55 @@ BACKENDS: dict[str, dict] = {
         "env_key": "MOONSHOT_API_KEY",
         "pricing": {"input": 0.74, "output": 4.66},  # USD per 1M tokens
         "temperature": None,  # kimi-k2.6 enforces its own fixed temperature; sending any value raises 400
+        "max_tokens": 16384,
+    },
+    "ollama": {
+        "base_url": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+        "default_model": os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b"),
+        "env_key": "OLLAMA_API_KEY",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": 0,
+        "max_tokens": 16384,
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "default_model": "gemini-3-flash-preview",
+        "env_keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "model_env_key": "GRAPHIFY_GEMINI_MODEL",
+        "pricing": {"input": 0.50, "output": 3.00},  # USD per 1M tokens
+        "temperature": 0,
+        "reasoning_effort": "low",
+        "max_completion_tokens": 16384,
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4.1-mini",
+        "env_key": "OPENAI_API_KEY",
+        "model_env_key": "GRAPHIFY_OPENAI_MODEL",
+        "pricing": {"input": 0.40, "output": 1.60},  # USD per 1M tokens
+        "temperature": 0,
+    },
+    "bedrock": {
+        "default_model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "model_env_key": "GRAPHIFY_BEDROCK_MODEL",
+        "pricing": {"input": 3.0, "output": 15.0},  # USD per 1M tokens
+        "temperature": 0,
+        "max_tokens": 16384,
     },
 }
+
+
+def _resolve_max_tokens(default: int) -> int:
+    """Honour GRAPHIFY_MAX_OUTPUT_TOKENS env var override, else use backend default."""
+    raw = os.environ.get("GRAPHIFY_MAX_OUTPUT_TOKENS", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return default
 
 _EXTRACTION_SYSTEM = """\
 You are a graphify semantic extraction agent. Extract a knowledge graph fragment from the files provided.
@@ -107,20 +156,63 @@ def _parse_llm_json(raw: str) -> dict:
         return {"nodes": [], "edges": [], "hyperedges": []}
 
 
+def _backend_env_keys(backend: str) -> list[str]:
+    """Return accepted API-key environment variables for a backend."""
+    cfg = BACKENDS[backend]
+    keys = cfg.get("env_keys")
+    if keys:
+        return list(keys)
+    env_key = cfg.get("env_key")
+    if env_key:
+        return [env_key]
+    return []
+
+
+def _get_backend_api_key(backend: str) -> str:
+    """Return the first configured API key for backend, or an empty string."""
+    for env_key in _backend_env_keys(backend):
+        value = os.environ.get(env_key)
+        if value:
+            return value
+    return ""
+
+
+def _format_backend_env_keys(backend: str) -> str:
+    """Return user-facing accepted API-key variable names."""
+    keys = _backend_env_keys(backend)
+    return " or ".join(keys) if keys else "AWS_PROFILE or AWS_REGION"
+
+
+def _default_model_for_backend(backend: str) -> str:
+    """Return configured model override or backend default model."""
+    cfg = BACKENDS[backend]
+    model_env_key = cfg.get("model_env_key")
+    if model_env_key:
+        model = os.environ.get(model_env_key)
+        if model:
+            return model
+    return cfg["default_model"]
+
+
 def _call_openai_compat(
     base_url: str,
     api_key: str,
     model: str,
     user_message: str,
     temperature: float | None = 0,
+    reasoning_effort: str | None = None,
+    max_completion_tokens: int = 8192,
+    *,
+    backend: str = "",
 ) -> dict:
     """Call any OpenAI-compatible API (Kimi, OpenAI, etc.) and return parsed JSON."""
     try:
         from openai import OpenAI
     except ImportError as exc:
+        pkg_hint = "graphifyy[kimi]" if backend == "kimi" else "openai"
         raise ImportError(
-            "Kimi/OpenAI-compatible extraction requires the openai package. "
-            "Run: pip install openai"
+            "Gemini/Kimi/Ollama/OpenAI-compatible extraction requires the openai package. "
+            f"Run: pip install {pkg_hint}"
         ) from exc
 
     client = OpenAI(api_key=api_key, base_url=base_url)
@@ -130,10 +222,12 @@ def _call_openai_compat(
             {"role": "system", "content": _EXTRACTION_SYSTEM},
             {"role": "user", "content": user_message},
         ],
-        "max_completion_tokens": 8192,
+        "max_completion_tokens": max_completion_tokens,
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
     # Kimi-k2.6 is a reasoning model — disable thinking so content isn't empty
     if "moonshot" in base_url:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
@@ -146,10 +240,18 @@ def _call_openai_compat(
     # mid-generation. The JSON we got back is truncated; callers should
     # treat this as a signal to retry with smaller input.
     result["finish_reason"] = resp.choices[0].finish_reason
+    output_tokens = result["output_tokens"]
+    if output_tokens < 50 and backend == "ollama":
+        print(
+            "[graphify] warning: ollama returned very few tokens — the model may be "
+            "too small or not following the JSON instruction format. "
+            "Try a larger model with --model (e.g. --model qwen2.5-coder:14b).",
+            file=sys.stderr,
+        )
     return result
 
 
-def _call_claude(api_key: str, model: str, user_message: str) -> dict:
+def _call_claude(api_key: str, model: str, user_message: str, max_tokens: int = 8192) -> dict:
     """Call Anthropic Claude directly (not via OpenAI compat layer)."""
     try:
         import anthropic
@@ -162,7 +264,7 @@ def _call_claude(api_key: str, model: str, user_message: str) -> dict:
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
         model=model,
-        max_tokens=8192,
+        max_tokens=max_tokens,
         system=_EXTRACTION_SYSTEM,
         messages=[{"role": "user", "content": user_message}],
     )
@@ -174,6 +276,43 @@ def _call_claude(api_key: str, model: str, user_message: str) -> dict:
     # vocabulary so the adaptive-retry layer doesn't have to know which
     # backend produced the result.
     result["finish_reason"] = "length" if resp.stop_reason == "max_tokens" else "stop"
+    return result
+
+
+def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192) -> dict:
+    """Call AWS Bedrock via boto3 Converse API using the standard AWS credential chain."""
+    try:
+        import boto3
+        import botocore.exceptions
+    except ImportError as exc:
+        raise ImportError(
+            "AWS Bedrock extraction requires boto3. Run: pip install graphifyy[bedrock]"
+        ) from exc
+
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    profile = os.environ.get("AWS_PROFILE")
+    session = boto3.Session(profile_name=profile, region_name=region)
+    client = session.client("bedrock-runtime")
+
+    try:
+        resp = client.converse(
+            modelId=model,
+            system=[{"text": _EXTRACTION_SYSTEM}],
+            messages=[{"role": "user", "content": [{"text": user_message}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0},
+        )
+    except botocore.exceptions.ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        msg = exc.response["Error"]["Message"]
+        raise RuntimeError(f"Bedrock API error ({code}): {msg}") from exc
+
+    text = resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "{}")
+    result = _parse_llm_json(text)
+    usage = resp.get("usage", {})
+    result["input_tokens"] = usage.get("inputTokens", 0)
+    result["output_tokens"] = usage.get("outputTokens", 0)
+    result["model"] = model
+    result["finish_reason"] = "length" if resp.get("stopReason") == "max_tokens" else "stop"
     return result
 
 
@@ -193,19 +332,32 @@ def extract_files_direct(
         raise ValueError(f"Unknown backend {backend!r}. Available: {sorted(BACKENDS)}")
 
     cfg = BACKENDS[backend]
-    key = api_key or os.environ.get(cfg["env_key"], "")
-    if not key:
+    key = api_key or _get_backend_api_key(backend)
+    if not key and backend == "ollama":
+        key = "ollama"  # Ollama ignores auth but openai client requires non-empty
+    if not key and backend != "bedrock":
         raise ValueError(
             f"No API key for backend '{backend}'. "
-            f"Set {cfg['env_key']} or pass api_key=."
+            f"Set {_format_backend_env_keys(backend)} or pass api_key=."
         )
-    mdl = model or cfg["default_model"]
+    mdl = model or _default_model_for_backend(backend)
     user_msg = _read_files(files, root)
+    max_out = _resolve_max_tokens(cfg.get("max_tokens", 8192))
 
     if backend == "claude":
-        return _call_claude(key, mdl, user_msg)
-    else:
-        return _call_openai_compat(cfg["base_url"], key, mdl, user_msg, temperature=cfg.get("temperature", 0))
+        return _call_claude(key, mdl, user_msg, max_tokens=max_out)
+    if backend == "bedrock":
+        return _call_bedrock(mdl, user_msg, max_tokens=max_out)
+    return _call_openai_compat(
+        cfg["base_url"],
+        key,
+        mdl,
+        user_msg,
+        temperature=cfg.get("temperature", 0),
+        reasoning_effort=cfg.get("reasoning_effort"),
+        max_completion_tokens=cfg.get("max_completion_tokens", max_out),
+        backend=backend,
+    )
 
 
 def _estimate_file_tokens(path: Path) -> int:
@@ -468,11 +620,18 @@ def estimate_cost(backend: str, input_tokens: int, output_tokens: int) -> float:
 def detect_backend() -> str | None:
     """Return the name of whichever backend has an API key set, or None.
 
-    Kimi is checked first (opt-in). Falls back to Claude if ANTHROPIC_API_KEY is set.
+    Priority: gemini → kimi → ollama (opt-in via OLLAMA_BASE_URL) → claude → openai.
+    Ollama is opt-in via env var — never auto-probed without OLLAMA_BASE_URL set.
     Claude is the default for the skill.md subagent pipeline and is never forced here.
     """
-    if os.environ.get("MOONSHOT_API_KEY"):
-        return "kimi"
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "claude"
+    for backend in ("gemini", "kimi"):
+        if _get_backend_api_key(backend):
+            return backend
+    if os.environ.get("OLLAMA_BASE_URL"):
+        return "ollama"
+    if os.environ.get("AWS_PROFILE") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
+        return "bedrock"
+    for backend in ("claude", "openai"):
+        if _get_backend_api_key(backend):
+            return backend
     return None

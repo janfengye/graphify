@@ -57,7 +57,9 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
 
     # Canonicalize legacy node/edge schema before validation.
     for node in extraction.get("nodes", []):
-        if isinstance(node, dict) and "source" in node and "source_file" not in node:
+        if not isinstance(node, dict):
+            continue
+        if "source" in node and "source_file" not in node:
             # Count edges that reference this node so the warning is actionable (#479)
             node_id = node.get("id", "?")
             affected_edges = sum(
@@ -71,6 +73,12 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
                 file=sys.stderr,
             )
             node["source_file"] = node.pop("source")
+        # Default missing/None file_type to "concept" so legacy graph.json
+        # entries (and stub nodes preserved by `_rebuild_code` from older
+        # graphify versions that didn't always populate file_type) don't
+        # trigger spurious "invalid file_type 'None'" validator warnings (#660).
+        if node.get("file_type") in (None, ""):
+            node["file_type"] = "concept"
 
     errors = validate_extraction(extraction)
     # Dangling edges (stdlib/external imports) are expected - only warn about real schema errors.
@@ -116,17 +124,27 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
     return G
 
 
-def build(extractions: list[dict], *, directed: bool = False) -> nx.Graph:
+def build(
+    extractions: list[dict],
+    *,
+    directed: bool = False,
+    dedup: bool = True,
+    dedup_llm_backend: str | None = None,
+) -> nx.Graph:
     """Merge multiple extraction results into one graph.
 
     directed=True produces a DiGraph that preserves edge direction (source→target).
     directed=False (default) produces an undirected Graph for backward compatibility.
+    dedup=True (default) runs entity deduplication before building the graph.
+    dedup_llm_backend: if set (e.g. "gemini", "claude", or "kimi"), uses LLM to resolve
+        ambiguous pairs in the 75–92 Jaro-Winkler score zone.
 
     Extractions are merged in order. For nodes with the same ID, the last
     extraction's attributes win (NetworkX add_node overwrites). Pass AST
     results before semantic results so semantic labels take precedence, or
     reverse the order if you prefer AST source_location precision to win.
     """
+    from graphify.dedup import deduplicate_entities
     combined: dict = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
     for ext in extractions:
         combined["nodes"].extend(ext.get("nodes", []))
@@ -134,6 +152,11 @@ def build(extractions: list[dict], *, directed: bool = False) -> nx.Graph:
         combined["hyperedges"].extend(ext.get("hyperedges", []))
         combined["input_tokens"] += ext.get("input_tokens", 0)
         combined["output_tokens"] += ext.get("output_tokens", 0)
+    if dedup and combined["nodes"]:
+        combined["nodes"], combined["edges"] = deduplicate_entities(
+            combined["nodes"], combined["edges"], communities={},
+            dedup_llm_backend=dedup_llm_backend,
+        )
     return build_from_json(combined, directed=directed)
 
 
@@ -194,6 +217,8 @@ def build_merge(
     prune_sources: list[str] | None = None,
     *,
     directed: bool = False,
+    dedup: bool = True,
+    dedup_llm_backend: str | None = None,
 ) -> nx.Graph:
     """Load existing graph.json, merge new chunks into it, and save back.
 
@@ -219,7 +244,7 @@ def build_merge(
         base = []
 
     all_chunks = base + list(new_chunks)
-    G = build(all_chunks, directed=directed)
+    G = build(all_chunks, directed=directed, dedup=dedup, dedup_llm_backend=dedup_llm_backend)
 
     # Prune nodes from deleted source files
     if prune_sources:
@@ -228,11 +253,23 @@ def build_merge(
             if d.get("source_file") in prune_sources
         ]
         G.remove_nodes_from(to_remove)
-        if to_remove:
-            print(f"[graphify] Pruned {len(to_remove)} node(s) from deleted sources.", file=sys.stderr)
+        n_files = len(prune_sources)
+        n_nodes = len(to_remove)
+        if n_nodes:
+            print(
+                f"[graphify] Pruned {n_nodes} node(s) from {n_files} deleted source file(s).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[graphify] {n_files} source file(s) deleted since last run — "
+                f"no matching nodes in graph, already clean.",
+                file=sys.stderr,
+            )
 
     # Safety check: refuse to shrink the graph silently (#479)
-    if graph_path.exists():
+    # Skip when dedup or prune_sources is active — shrinkage is intentional there.
+    if graph_path.exists() and not dedup and not prune_sources:
         existing_n = len(existing_nodes)
         new_n = G.number_of_nodes()
         if new_n < existing_n:
@@ -242,3 +279,26 @@ def build_merge(
             )
 
     return G
+
+
+def prefix_graph_for_global(G: nx.Graph, repo_tag: str) -> nx.Graph:
+    """Return a copy of G with all node IDs prefixed with repo_tag::.
+
+    Labels are preserved unchanged (for display). A 'local_id' attribute
+    is added to each node so the original ID can be recovered. Edges are
+    rewritten to match the new prefixed IDs. The 'repo' attribute is set
+    on every node.
+    """
+    relabel = {n: f"{repo_tag}::{n}" for n in G.nodes}
+    H = nx.relabel_nodes(G, relabel, copy=True)
+    for node, data in H.nodes(data=True):
+        data["repo"] = repo_tag
+        data.setdefault("local_id", node.split("::", 1)[1])
+    return H
+
+
+def prune_repo_from_graph(G: nx.Graph, repo_tag: str) -> int:
+    """Remove all nodes tagged with repo_tag from G in-place. Returns count removed."""
+    to_remove = [n for n, d in G.nodes(data=True) if d.get("repo") == repo_tag]
+    G.remove_nodes_from(to_remove)
+    return len(to_remove)
