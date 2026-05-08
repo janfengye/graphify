@@ -10,7 +10,7 @@
   <a href="https://safishamsi.gumroad.com/l/qetvlo"><img src="https://img.shields.io/badge/Book-The%20Memory%20Layer-2ea44f?style=flat&logo=gitbook&logoColor=white" alt="The Memory Layer"/></a>
   <a href="https://github.com/safishamsi/graphify/actions/workflows/ci.yml"><img src="https://github.com/safishamsi/graphify/actions/workflows/ci.yml/badge.svg?branch=v7" alt="CI"/></a>
   <a href="https://pypi.org/project/graphifyy/"><img src="https://img.shields.io/pypi/v/graphifyy" alt="PyPI"/></a>
-  <a href="https://pepy.tech/project/graphifyy"><img src="https://static.pepy.tech/badge/graphifyy" alt="Downloads"/></a>
+  <a href="https://pypistats.org/packages/graphifyy"><img src="https://static.pepy.tech/personalized-badge/graphifyy?period=total&units=international_system&left_color=grey&right_color=brightgreen&left_text=downloads" alt="Downloads"/></a>
   <a href="https://github.com/sponsors/safishamsi"><img src="https://img.shields.io/badge/sponsor-safishamsi-ea4aaa?logo=github-sponsors" alt="Sponsor"/></a>
   <a href="https://www.linkedin.com/in/safi-shamsi"><img src="https://img.shields.io/badge/LinkedIn-Safi%20Shamsi-0077B5?logo=linkedin" alt="LinkedIn"/></a>
   <a href="https://x.com/graphifyy"><img src="https://img.shields.io/badge/X-graphifyy-000000?logo=x&logoColor=white" alt="X"/></a>
@@ -111,7 +111,7 @@ Run this once in your project after building a graph:
 
 This writes a small config file that tells your assistant to read `GRAPH_REPORT.md` before answering questions about your codebase. On platforms that support hooks (Claude Code, Codex, Gemini CLI), a hook fires automatically before every file-read call — your assistant navigates by the graph instead of grepping through everything.
 
-Uninstall with the matching command (e.g. `graphify claude uninstall`).
+To remove graphify from all platforms at once: `graphify uninstall` (add `--purge` to also delete `graphify-out/`). Or use the per-platform command (e.g. `graphify claude uninstall`).
 
 ---
 
@@ -276,6 +276,9 @@ The MCP server gives your assistant structured access: `query_graph`, `get_node`
 /graphify query "..." --dfs --budget 1500
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
+
+graphify uninstall                 # remove from all platforms in one shot
+graphify uninstall --purge         # also delete graphify-out/
 
 graphify hook install              # post-commit + post-checkout hooks
 graphify hook uninstall
