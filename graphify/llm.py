@@ -170,6 +170,26 @@ def _parse_llm_json(raw: str) -> dict:
         return {"nodes": [], "edges": [], "hyperedges": []}
 
 
+def _response_is_hollow(raw_content: str | None, parsed: dict) -> bool:
+    """Detect a successful HTTP response that yielded no usable extraction.
+
+    A local model under load (most often Ollama) can return HTTP 200 with an
+    empty / null `message.content`, with whitespace, or with a half-generated
+    JSON prefix that fails to parse. All of these collapse to a "successful"
+    call producing zero nodes and zero edges. Without this check the chunk
+    is silently dropped from the corpus because no exception is raised and
+    `finish_reason` is `"stop"` rather than `"length"`. By flagging the
+    result as hollow, callers can re-route it through the same bisection
+    path used for context-window overflow and `finish_reason="length"`.
+    """
+    if raw_content is None or not raw_content.strip():
+        return True
+    nodes = parsed.get("nodes")
+    edges = parsed.get("edges")
+    hyperedges = parsed.get("hyperedges")
+    return not nodes and not edges and not hyperedges
+
+
 def _backend_env_keys(backend: str) -> list[str]:
     """Return accepted API-key environment variables for a backend."""
     cfg = BACKENDS[backend]
@@ -259,8 +279,32 @@ def _call_openai_compat(
     # Kimi-k2.6 is a reasoning model — disable thinking so content isn't empty
     if "moonshot" in base_url:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    # Ollama defaults num_ctx to 2048 and silently truncates prompts larger
+    # than that — the symptom is hollow 200 OK responses after the first few
+    # chunks (#798). We derive num_ctx from the actual prompt size so we don't
+    # over-allocate KV-cache VRAM. Over-allocation (e.g. 128k slots for an 8k
+    # prompt on a 31B model) exhausts VRAM by chunk 4 and produces the same
+    # hollow-200 symptom — just from a different direction (#798 follow-up).
+    # Formula: actual input tokens + output cap + system prompt headroom.
+    # Capped at 131072 (enough for the default 60k token_budget); env var wins.
+    if backend == "ollama":
+        num_ctx_raw = os.environ.get("GRAPHIFY_OLLAMA_NUM_CTX", "").strip()
+        if num_ctx_raw:
+            try:
+                num_ctx = int(num_ctx_raw)
+            except ValueError:
+                num_ctx = 131072
+        else:
+            # Estimate input tokens: user_message chars / 4 (standard BPE
+            # heuristic) + 400 for the system prompt, then add output headroom.
+            estimated_input = len(user_message) // _CHARS_PER_TOKEN + 400
+            num_ctx = min(estimated_input + max_completion_tokens + 2000, 131072)
+            num_ctx = max(num_ctx, 8192)  # floor: never under-allocate badly
+        keep_alive = os.environ.get("GRAPHIFY_OLLAMA_KEEP_ALIVE", "30m")
+        kwargs["extra_body"] = {"options": {"num_ctx": num_ctx}, "keep_alive": keep_alive}
     resp = client.chat.completions.create(**kwargs)
-    result = _parse_llm_json(resp.choices[0].message.content or "{}")
+    raw_content = resp.choices[0].message.content
+    result = _parse_llm_json(raw_content or "{}")
     result["input_tokens"] = resp.usage.prompt_tokens if resp.usage else 0
     result["output_tokens"] = resp.usage.completion_tokens if resp.usage else 0
     result["model"] = model
@@ -268,12 +312,29 @@ def _call_openai_compat(
     # mid-generation. The JSON we got back is truncated; callers should
     # treat this as a signal to retry with smaller input.
     result["finish_reason"] = resp.choices[0].finish_reason
+    # An overwhelmed local model (typically Ollama) can return HTTP 200 with
+    # empty / null content or unparseable half-generated JSON. The call looks
+    # successful, `finish_reason` is `"stop"`, and the chunk would be silently
+    # dropped from the corpus. Re-label as `"length"` so the adaptive retry
+    # layer bisects the chunk — same recovery as a true truncation.
+    if _response_is_hollow(raw_content, result) and result["finish_reason"] != "length":
+        print(
+            f"[graphify] {backend or 'backend'} returned a hollow response "
+            f"(content={'empty' if not (raw_content or '').strip() else 'no nodes/edges'}, "
+            f"output_tokens={result['output_tokens']}); "
+            "treating as truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
     output_tokens = result["output_tokens"]
     if output_tokens < 50 and backend == "ollama":
         print(
-            "[graphify] warning: ollama returned very few tokens — the model may be "
-            "too small or not following the JSON instruction format. "
-            "Try a larger model with --model (e.g. --model qwen2.5-coder:14b).",
+            "[graphify] warning: ollama returned very few tokens — likely causes: "
+            "(1) VRAM pressure: check `nvidia-smi` and reduce chunk size with "
+            "--token-budget (e.g. --token-budget 4096) or set "
+            "GRAPHIFY_OLLAMA_NUM_CTX to a smaller value; "
+            "(2) model too small for JSON instruction following — "
+            "try a larger model with --model (e.g. --model qwen2.5-coder:14b).",
             file=sys.stderr,
         )
     return result
@@ -296,7 +357,8 @@ def _call_claude(api_key: str, model: str, user_message: str, max_tokens: int = 
         system=_EXTRACTION_SYSTEM,
         messages=[{"role": "user", "content": user_message}],
     )
-    result = _parse_llm_json(resp.content[0].text if resp.content else "{}")
+    raw_content = resp.content[0].text if resp.content else None
+    result = _parse_llm_json(raw_content or "{}")
     result["input_tokens"] = resp.usage.input_tokens if resp.usage else 0
     result["output_tokens"] = resp.usage.output_tokens if resp.usage else 0
     result["model"] = model
@@ -304,6 +366,13 @@ def _call_claude(api_key: str, model: str, user_message: str, max_tokens: int = 
     # vocabulary so the adaptive-retry layer doesn't have to know which
     # backend produced the result.
     result["finish_reason"] = "length" if resp.stop_reason == "max_tokens" else "stop"
+    if _response_is_hollow(raw_content, result) and result["finish_reason"] != "length":
+        print(
+            "[graphify] claude returned a hollow response; treating as "
+            "truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
     return result
 
 
@@ -341,6 +410,13 @@ def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192) -> dict
     result["output_tokens"] = usage.get("outputTokens", 0)
     result["model"] = model
     result["finish_reason"] = "length" if resp.get("stopReason") == "max_tokens" else "stop"
+    if _response_is_hollow(text, result) and result["finish_reason"] != "length":
+        print(
+            "[graphify] bedrock returned a hollow response; treating as "
+            "truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
     return result
 
 
@@ -505,7 +581,7 @@ def _extract_with_adaptive_retry(
     or the API rejects the prompt as too large for the model's context window,
     split the chunk in half and recurse.
 
-    Two signals drive the retry:
+    Three signals drive the retry, all funnelled through the same code:
 
     - `finish_reason == "length"` — the model accepted the input but ran out of
       `max_completion_tokens` mid-output. The truncated JSON is unparseable, so
@@ -517,6 +593,12 @@ def _extract_with_adaptive_retry(
       Without a retry the whole chunk would fail with no output. Splitting in
       half is the same recovery as for the `length` case and works for the
       same reason.
+
+    - hollow successful responses — the model returned HTTP 200 with empty,
+      null, or unparseable content (typical of a local Ollama under load).
+      `_call_openai_compat` re-labels these as `finish_reason="length"` so they
+      take the same recovery path; without that the chunk would be silently
+      dropped from the corpus.
 
     Recursion is capped at `max_depth` to bound worst-case cost. A chunk of N
     files can split into up to 2**max_depth pieces — at depth=3 that's 8x. If
@@ -686,6 +768,11 @@ def extract_corpus_parallel(
         except Exception as exc:  # noqa: BLE001 — caller-facing surface, log + continue
             return idx, None, exc
 
+    # Ollama serves one request at a time per loaded model on a single GPU.
+    # Four concurrent 60k-token requests cause VRAM pressure and hollow
+    # responses after 3-4 chunks (#798). Force serial unless the user opts in.
+    if backend == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     workers = max(1, min(max_concurrency, total))
     if workers == 1:
         # Avoid thread pool overhead for single-worker runs (and keep
