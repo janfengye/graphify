@@ -33,7 +33,7 @@ VIDEO_EXTENSIONS = {'.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.mp3', '.w
 
 CORPUS_WARN_THRESHOLD = 50_000    # words - below this, warn "you may not need a graph"
 CORPUS_UPPER_THRESHOLD = 500_000  # words - above this, warn about token cost
-FILE_COUNT_UPPER = 200             # files - above this, warn about token cost
+FILE_COUNT_UPPER = 500             # files - above this, warn about token cost
 
 # Parent directories whose contents are always sensitive.
 # Checked against path.parts[:-1] (parents only) so a root-level file named
@@ -825,7 +825,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         warning = (
             f"Large corpus: {total_files} files · ~{total_words:,} words. "
             f"Semantic extraction will be expensive (many Claude tokens). "
-            f"Consider running on a subfolder, or use --no-semantic to run AST-only."
+            f"Consider running on a subfolder."
         )
 
     return {
@@ -836,6 +836,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         "warning": warning,
         "skipped_sensitive": skipped_sensitive,
         "graphifyignore_patterns": len(ignore_patterns),
+        "scan_root": str(root.resolve()),
     }
 
 
