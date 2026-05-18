@@ -2,6 +2,20 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.8.12 (2026-05-18)
+
+- Security: `_is_sensitive` now correctly flags underscore-prefixed secret filenames (`api_token.txt`, `oauth_token.json`) — `\b` word boundary was treating `_` as a word char, so names like `api_token` never matched (#920)
+- Security: `_is_sensitive` now checks parent directories against a `_SENSITIVE_DIRS` blocklist (`.ssh`, `.aws`, `.gcloud`, `secrets`, etc.) and exempts code-extension files from name-pattern checks so `tokenizer.py` is never skipped (#920)
+- Fix: `--wiki` Relationships section was always empty — `_cross_community_links` read `community` from node attributes (always None) instead of the `communities` dict; `_god_node_article` had the same bug and never linked to the owning community (#925)
+- Fix: `--watch` now respects `.graphifyignore` — the event handler was checking extensions before the ignore filter, so paths inside `node_modules/`, `.venv/`, etc. triggered rebuilds (#928)
+
+## 0.8.11 (2026-05-18)
+
+- Fix: LLM empty choices / None message guard — Gemini and other providers return `choices=[]` on content-filtered HTTP 200 responses; now raises a clean error instead of crashing with IndexError (#924)
+- Fix: OpenCode skill removed invalid `general-purpose` agent reference and headless-incompatible interactive halt (#911, closes #825)
+- Fix: Codex skill now uses graphify query/explain/path even when graph artifacts are dirty in worktree (#913, closes #860)
+- Perf: precompute degrees once in surprise scoring — ~11x speedup per lookup on large graphs (#914)
+
 ## 0.8.10 (2026-05-17)
 
 - Fix: git hooks phantom directory on git < 2.31 — drop `--path-format=absolute`, validate path contains no newlines, anchor relative paths on repo root (#907)
