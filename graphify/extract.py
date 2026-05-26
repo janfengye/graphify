@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Any
 from .cache import load_cached, save_cached
+from .mcp_ingest import extract_mcp_config, is_mcp_config_path
 
 _RECURSION_LIMIT = 10_000
 
@@ -3109,6 +3110,8 @@ def extract_dart(path: Path) -> dict:
     except OSError:
         return {"error": f"cannot read {path}"}
 
+    # Use stem (not str(path)) for child IDs to keep them machine-independent.
+    stem = _file_stem(path)
     file_nid = _make_id(str(path))
     nodes = [{"id": file_nid, "label": path.name, "file_type": "code",
               "source_file": str(path), "source_location": None}]
@@ -3117,7 +3120,7 @@ def extract_dart(path: Path) -> dict:
 
     # Classes and mixins
     for m in re.finditer(r"^\s*(?:abstract\s+)?(?:class|mixin)\s+(\w+)", src, re.MULTILINE):
-        nid = _make_id(str(path), m.group(1))
+        nid = _make_id(stem, m.group(1))
         if nid not in defined:
             nodes.append({"id": nid, "label": m.group(1), "file_type": "code",
                           "source_file": str(path), "source_location": None})
@@ -3131,7 +3134,7 @@ def extract_dart(path: Path) -> dict:
         name = m.group(1)
         if name in {"if", "for", "while", "switch", "catch", "return"}:
             continue
-        nid = _make_id(str(path), name)
+        nid = _make_id(stem, name)
         if nid not in defined:
             nodes.append({"id": nid, "label": name, "file_type": "code",
                           "source_file": str(path), "source_location": None})
@@ -7386,6 +7389,30 @@ def extract_delphi_form(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
 
 
+# Size cap for project XML files we parse with stdlib ElementTree.
+# Real .csproj/.fsproj/.vbproj/.lpk files are well under 2 MiB; anything
+# larger is either malformed or hostile.
+_PROJECT_XML_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _project_xml_is_safe(src: bytes) -> bool:
+    """Reject XML that declares DTDs or entities.
+
+    Stdlib ``xml.etree.ElementTree`` does not cap entity expansion, so a
+    crafted project file could trigger a billion-laughs style DoS. External
+    entity resolution is already disabled by pyexpat defaults, but rejecting
+    ``<!DOCTYPE`` / ``<!ENTITY`` outright is defense in depth.
+
+    Legitimate MSBuild and Lazarus package files never contain a DOCTYPE
+    or ENTITY declaration, so this is a zero-false-positive screen.
+    """
+    # Only the prolog can hold a DTD/internal subset, but be conservative
+    # and scan the full byte range -- these formats use ASCII tags so a
+    # case-insensitive substring match is sufficient.
+    lowered = src.lower()
+    return b"<!doctype" not in lowered and b"<!entity" not in lowered
+
+
 def extract_lazarus_package(path: Path) -> dict:
     """Extract package metadata from Lazarus .lpk package files (XML format).
 
@@ -7405,8 +7432,18 @@ def extract_lazarus_package(path: Path) -> dict:
     """
     try:
         import xml.etree.ElementTree as ET
-        text = path.read_text(encoding="utf-8", errors="replace")
-        xml_root = ET.fromstring(text)
+        src = path.read_bytes()
+    except OSError as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    if len(src) > _PROJECT_XML_MAX_BYTES:
+        return {"nodes": [], "edges": [], "error": "package file too large"}
+    if not _project_xml_is_safe(src):
+        return {"nodes": [], "edges": [],
+                "error": "refusing XML with DOCTYPE/ENTITY declaration"}
+
+    try:
+        xml_root = ET.fromstring(src)
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
@@ -7795,8 +7832,11 @@ def extract_csproj(path: Path) -> dict:
     except OSError:
         return {"nodes": [], "edges": [], "error": f"cannot read {path}"}
 
-    if len(src) > 2_097_152:
+    if len(src) > _PROJECT_XML_MAX_BYTES:
         return {"nodes": [], "edges": [], "error": "project file too large"}
+    if not _project_xml_is_safe(src):
+        return {"nodes": [], "edges": [],
+                "error": "refusing XML with DOCTYPE/ENTITY declaration"}
 
     try:
         tree = ET.fromstring(src)
@@ -8234,6 +8274,11 @@ def _get_extractor(path: Path) -> Any | None:
     """Return the correct extractor function for a file, or None if unsupported."""
     if path.name.endswith(".blade.php"):
         return extract_blade
+    # MCP config files (.mcp.json, claude_desktop_config.json, ...) are routed
+    # by filename before generic .json dispatch so they get MCP-aware nodes
+    # (servers, commands, packages, env vars) instead of opaque JSON keys.
+    if is_mcp_config_path(path):
+        return extract_mcp_config
     return _DISPATCH.get(path.suffix)
 
 
@@ -8637,7 +8682,7 @@ def extract(
         if not sf_path.is_absolute():
             continue
         try:
-            item["source_file"] = str(sf_path.relative_to(root))
+            item["source_file"] = sf_path.relative_to(root).as_posix()
         except ValueError:
             pass
 
