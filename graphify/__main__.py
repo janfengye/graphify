@@ -171,7 +171,13 @@ def _packaged_skill_refs_dir(platform_name: str) -> Path | None:
     A platform opts into progressive disclosure by setting ``skill_refs`` in its
     ``_PLATFORM_CONFIG`` entry. The value names a bundle under
     ``graphify/skills/<bundle>/references/``. Reuse keys (e.g. trae-cn) point at
-    their twin's bundle. ``gemini`` has no config entry and is never progressive.
+    their twin's bundle.
+
+    ``gemini`` has no ``_PLATFORM_CONFIG`` entry: it installs claude's
+    ``skill.md`` body verbatim (see ``_copy_skill_file``). Since that body is the
+    lean progressive core that links to ``references/``, gemini needs claude's
+    references/ sidecar too, or its SKILL.md ships with dead pointers. So gemini
+    resolves to the claude bundle rather than opting out.
 
     Bundles ship one platform-group at a time. A host whose bundle directory
     ``graphify/skills/<bundle>/`` is not in this build has not gone progressive
@@ -182,8 +188,9 @@ def _packaged_skill_refs_dir(platform_name: str) -> Path | None:
     the empty-sidecar regression the wheel-content test also guards).
     """
     if platform_name == "gemini":
-        return None
-    bundle = _PLATFORM_CONFIG[platform_name].get("skill_refs")
+        bundle = "claude"
+    else:
+        bundle = _PLATFORM_CONFIG[platform_name].get("skill_refs")
     if not bundle:
         return None
     bundle_dir = Path(__file__).parent / "skills" / bundle
@@ -355,6 +362,35 @@ _SETTINGS_HOOK = {
                 r"""  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify: knowledge graph at graphify-out/. For focused questions, run `graphify query \"<question>\"` (scoped subgraph, usually much smaller than GRAPH_REPORT.md) instead of grepping raw files. Read GRAPH_REPORT.md only for broad architecture context."}}' """
                 "  || true ;; "
                 "esac"
+            ),
+        }
+    ],
+}
+
+_READ_SETTINGS_HOOK = {
+    # The Bash hook above never sees a file read through the native Read tool or a
+    # Glob, which is the most common way an agent skips the graph: answering a
+    # codebase question by Read-ing many source files one by one (issue #1114).
+    # Match Read|Glob, inspect the target path, and nudge (never block) only for a
+    # source/doc file outside graphify-out/ when a graph exists. The parser is
+    # python3 (already a graphify dependency), the shell is POSIX, and every branch
+    # fails open, so a legitimate read always goes through. Reading the graph's own
+    # report under graphify-out/ is suppressed so it never starts a feedback loop.
+    "matcher": "Read|Glob",
+    "hooks": [
+        {
+            "type": "command",
+            "command": (
+                "HIT=$(python3 -c \""
+                "import json,sys;"
+                "d=json.load(sys.stdin);"
+                "t=d.get('tool_input',d);"
+                "s=(str(t.get('file_path') or '')+' '+str(t.get('pattern') or '')+' '+str(t.get('path') or '')).lower().replace(chr(92),'/');"
+                "exts=('.py','.js','.ts','.tsx','.jsx','.go','.rs','.java','.rb','.c','.h','.cpp','.hpp','.cc','.cs','.kt','.swift','.php','.scala','.lua','.sh','.md','.rst','.txt','.mdx');"
+                "sys.stdout.write('1' if 'graphify-out/' not in s and any(e in s for e in exts) else '')\" 2>/dev/null || true); "
+                "if [ \"$HIT\" = 1 ] && [ -f graphify-out/graph.json ]; then "
+                r"""echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"graphify: knowledge graph at graphify-out/. For codebase questions, run `graphify query \"<question>\"` (scoped subgraph, usually much smaller than reading files one by one), `graphify explain \"<concept>\"`, or `graphify path \"<A>\" \"<B>\"`, instead of reading source files to answer. Read raw files to modify or debug specific code, or when the graph lacks the detail."}}'; """
+                "fi || true"
             ),
         }
     ],
@@ -913,20 +949,23 @@ def _kiro_uninstall(project_dir: Path) -> None:
     print("Removed: " + (", ".join(removed) if removed else "nothing to remove"))
 
 
-def _antigravity_install(project_dir: Path) -> None:
-    """Install graphify for Google Antigravity: skill + .agents/rules + .agents/workflows."""
-    # 1. Copy skill file to ~/.gemini/config/skills/graphify/SKILL.md (global)
-    install(platform="antigravity")
+def _antigravity_finalize(skill_dst: Path, project_dir: Path) -> None:
+    """Write Antigravity's always-on layer next to an installed skill.
 
-    # 1.5. Inject YAML frontmatter for native Antigravity tool discovery
-    skill_dst = _platform_skill_destination("antigravity")
+    Injects the native tool-discovery YAML frontmatter into *skill_dst*, then
+    writes ``.agents/rules/graphify.md`` and ``.agents/workflows/graphify.md``
+    under *project_dir*. Shared by the global ``antigravity install`` and the
+    project-scoped ``install --project --platform antigravity`` paths, so both lay
+    down the rules/workflows that the uninstall path already expects to remove.
+    """
+    # Inject YAML frontmatter for native Antigravity tool discovery.
     if skill_dst.exists():
         content = skill_dst.read_text(encoding="utf-8")
         if not content.startswith("---\n"):
             frontmatter = "---\nname: graphify-manager\ndescription: Rebuild the code graph or perform manual CLI queries when MCP server is offline.\n---\n\n"
             skill_dst.write_text(frontmatter + content, encoding="utf-8")
 
-    # 2. Write .agents/rules/graphify.md
+    # .agents/rules/graphify.md
     rules_path = project_dir / _ANTIGRAVITY_RULES_PATH
     rules_path.parent.mkdir(parents=True, exist_ok=True)
     if rules_path.exists():
@@ -940,7 +979,7 @@ def _antigravity_install(project_dir: Path) -> None:
         rules_path.write_text(_always_on("antigravity-rules"), encoding="utf-8")
         print(f"graphify rule written to {rules_path.resolve()}")
 
-    # 3. Write .agents/workflows/graphify.md
+    # .agents/workflows/graphify.md
     wf_path = project_dir / _ANTIGRAVITY_WORKFLOW_PATH
     wf_path.parent.mkdir(parents=True, exist_ok=True)
     if wf_path.exists():
@@ -953,6 +992,14 @@ def _antigravity_install(project_dir: Path) -> None:
     else:
         wf_path.write_text(_ANTIGRAVITY_WORKFLOW, encoding="utf-8")
         print(f"graphify workflow written to {wf_path.resolve()}")
+
+
+def _antigravity_install(project_dir: Path) -> None:
+    """Install graphify for Google Antigravity (global skill + .agents/rules + .agents/workflows)."""
+    # Copy the skill to ~/.gemini/config/skills/graphify/SKILL.md (global), then
+    # lay down the always-on rules/workflows under the project dir.
+    install(platform="antigravity")
+    _antigravity_finalize(_platform_skill_destination("antigravity"), project_dir)
 
     print()
     print("Antigravity will now check the knowledge graph before answering")
@@ -1521,7 +1568,14 @@ def _project_install(platform_name: str, project_dir: Path | None = None) -> Non
         skill_dst = _copy_skill_file("devin", project=True, project_dir=project_dir)
         _devin_rules_install(project_dir)
         _print_project_git_add_hint([_project_scope_root(skill_dst, project_dir), project_dir / ".windsurf"])
-    elif platform_name in ("copilot", "pi", "antigravity", "kimi"):
+    elif platform_name == "antigravity":
+        # Project-scoped: skill in .agents/skills/ PLUS the .agents/rules +
+        # .agents/workflows always-on layer (previously this path wrote only the
+        # skill, leaving the rules/workflows the uninstall path removes unset).
+        skill_dst = _copy_skill_file("antigravity", project=True, project_dir=project_dir)
+        _antigravity_finalize(skill_dst, project_dir)
+        _print_project_git_add_hint([_project_scope_root(skill_dst, project_dir), project_dir / ".agents"])
+    elif platform_name in ("copilot", "pi", "kimi"):
         skill_dst = _copy_skill_file(platform_name, project=True, project_dir=project_dir)
         _print_project_git_add_hint([_project_scope_root(skill_dst, project_dir)])
     else:
@@ -1699,10 +1753,11 @@ def _install_claude_hook(project_dir: Path) -> None:
     hooks = settings.setdefault("hooks", {})
     pre_tool = hooks.setdefault("PreToolUse", [])
 
-    hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash") and "graphify" in str(h))]
+    hooks["PreToolUse"] = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
     hooks["PreToolUse"].append(_SETTINGS_HOOK)
+    hooks["PreToolUse"].append(_READ_SETTINGS_HOOK)
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    print(f"  .claude/settings.json  ->  PreToolUse hook registered")
+    print(f"  .claude/settings.json  ->  PreToolUse hooks registered (Bash search + Read/Glob)")
 
 
 def _uninstall_claude_hook(project_dir: Path) -> None:
@@ -1715,7 +1770,7 @@ def _uninstall_claude_hook(project_dir: Path) -> None:
     except json.JSONDecodeError:
         return
     pre_tool = settings.get("hooks", {}).get("PreToolUse", [])
-    filtered = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash") and "graphify" in str(h))]
+    filtered = [h for h in pre_tool if not (h.get("matcher") in ("Glob|Grep", "Bash", "Read|Glob") and "graphify" in str(h))]
     if len(filtered) == len(pre_tool):
         return
     settings["hooks"]["PreToolUse"] = filtered
@@ -2360,6 +2415,10 @@ def main() -> None:
                     i += 1
             if not base_url or not default_model or not env_key:
                 print("Error: --base-url, --default-model, and --env-key are required.", file=sys.stderr)
+                sys.exit(1)
+            from graphify.llm import provider_base_url_ok
+            if not provider_base_url_ok(base_url, name):
+                print(f"Error: refusing to add provider with unsafe base_url {base_url!r}.", file=sys.stderr)
                 sys.exit(1)
             global_path.parent.mkdir(parents=True, exist_ok=True)
             existing = {}
@@ -3758,6 +3817,17 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if backend == "ollama":
+            # Fail closed with a clean message (not a deep traceback) if
+            # OLLAMA_BASE_URL points at a link-local/metadata address. warn=False:
+            # the later in-flow call owns the user-facing warning for LAN hosts.
+            from graphify.llm import _validate_ollama_base_url
+            _oll_url = os.environ.get("OLLAMA_BASE_URL", _BACKENDS["ollama"].get("base_url", ""))
+            try:
+                _validate_ollama_base_url(_oll_url, warn=False)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(2)
         if not _get_backend_api_key(backend):
             # Ollama on a loopback URL ignores auth entirely; don't block
             # the run just because OLLAMA_API_KEY is unset (issue #792).

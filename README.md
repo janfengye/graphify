@@ -107,7 +107,8 @@ graphify install --project --platform codex
 ```
 
 Project-scoped installs write under the current directory, for example
-`.claude/skills/graphify/SKILL.md` or `.agents/skills/graphify/SKILL.md`, and
+`.claude/skills/graphify/SKILL.md` or `.agents/skills/graphify/SKILL.md` (plus a
+`references/` sidecar the skill loads on demand), and
 print a `git add` hint for files that can be committed.
 Per-platform commands that support project-scoped installs accept the same flag,
 for example `graphify claude install --project` or `graphify codex install --project`.
@@ -164,6 +165,7 @@ Install only what you need:
 | `ollama` | Ollama local inference | `uv tool install "graphifyy[ollama]"` |
 | `openai` | OpenAI / OpenAI-compatible APIs | `uv tool install "graphifyy[openai]"` |
 | `gemini` | Google Gemini API | `uv tool install "graphifyy[gemini]"` |
+| `anthropic` | Anthropic Claude API (`--backend claude`, uses `ANTHROPIC_API_KEY`) | `uv tool install "graphifyy[anthropic]"` |
 | `bedrock` | AWS Bedrock (uses IAM, no API key) | `uv tool install "graphifyy[bedrock]"` |
 | `sql` | SQL schema extraction | `uv tool install "graphifyy[sql]"` |
 | `dm` | BYOND DreamMaker `.dm`/`.dme` AST extraction (may need a C compiler + `python3-dev` if no wheel matches your platform) | `uv tool install "graphifyy[dm]"` |
@@ -199,7 +201,7 @@ Run this once in your project after building a graph:
 | Devin CLI | `graphify devin install` |
 | Google Antigravity | `graphify antigravity install` |
 
-This writes a small config file that tells your assistant to consult the knowledge graph for codebase questions — preferring scoped queries like `graphify query "<question>"` over reading the full report or grepping raw files. On platforms that support payload-bearing hooks (Claude Code, Gemini CLI), a hook fires automatically before search-style tool calls and nudges your assistant toward the graph path. On the others (Codex, OpenCode, Cursor, etc.), the persistent instruction files (`AGENTS.md`, `.cursor/rules/`, etc.) provide the same query-first guidance. `GRAPH_REPORT.md` is still available for broad architecture review.
+This writes a small config file that tells your assistant to consult the knowledge graph for codebase questions — preferring scoped queries like `graphify query "<question>"` over reading the full report or grepping raw files. On platforms that support payload-bearing hooks (Claude Code, Gemini CLI), a hook fires automatically before search-style tool calls (and, on Claude Code, before reading source files one by one via the Read/Glob tools) and nudges your assistant toward the graph path. On the others (Codex, OpenCode, Cursor, etc.), the persistent instruction files (`AGENTS.md`, `.cursor/rules/`, etc.) provide the same query-first guidance. `GRAPH_REPORT.md` is still available for broad architecture review.
 
 To remove graphify from all platforms at once: `graphify uninstall` (add `--purge` to also delete `graphify-out/`). Or use the per-platform command (e.g. `graphify claude uninstall`).
 
