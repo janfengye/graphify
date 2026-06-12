@@ -4,6 +4,19 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+## 0.8.39 (2026-06-12)
+
+- Perf: O(n²)→O(n) LSH neighbor lookup in `deduplicate_entities`. The inner scan `next(n for n in candidates if n["id"]==neighbor_id)` was O(n) per neighbor; replaced with a `candidates_by_id` dict built once per pass. Also adds a `norm_cache` to avoid re-normalising labels on every comparison.
+- Fix: `graphify merge-chunks` summary now prints the node count instead of the raw list object. `global_graph.py` printed `merged['nodes']` (the list) instead of `len(merged['nodes'])`.
+- Fix: manifest data-loss on corrupt `~/.graphify/manifest.json`. A parse error previously triggered `except Exception: pass`, silently returning an empty manifest and overwriting the file — wiping all tracked repos. The corrupt file is now renamed to a timestamped `.corrupt.<ts>` backup with a stderr warning before starting fresh.
+- Fix: tree-sitter grammar packages now have pinned upper-bound version ranges in `pyproject.toml`. Grammar packages routinely break node-type and field APIs across minor bumps; ceilings prevent silent breakage on future upgrades.
+- Feat: FalkorDB export backend. `graphify export falkordb --push redis://localhost:6379` pushes the graph to a FalkorDB instance. Optional dep (`uv tool install "graphifyy[falkordb]"`); lazy import; idempotent (MERGE semantics); Cypher injection guarded.
+
+- Fix: `affected` and `graphify query` now handle graph files that use `"edges"` as the top-level key instead of `"links"`. Graphs produced by native `graphify extract` on some corpus layouts used `"edges"`; loading them in `affected.py` raised `KeyError: 'links'`. Normalised using the same established pattern already in `__main__.py` and `serve.py`.
+- Fix: a single `!` negation rule in `.graphifyignore` no longer disables all directory pruning. Previously any negation pattern caused `collect_files` to descend every ignored directory to look for re-included files. Since gitignore semantics cannot rescue files beneath an excluded parent, this descent was always wasted — the per-file filter still excluded them. Pruning now proceeds unconditionally; only the final per-file `_is_ignored` check is consulted for negation.
+- Feat: `--model` flag added to `graphify label-communities` and `graphify cluster-only`. Routes through `generate_community_labels` → `label_communities` → `_call_llm`; defaults to `None` (keeps existing backend default). Also fixes a latent arg-parsing bug where `--backend gemini` (space-separated) was mis-parsed as the positional path argument.
+- Docs: Persian (فارسی) README translation added (`docs/translations/README.fa-IR.md`).
+
 ## 0.8.38 (2026-06-11)
 
 - Fix: LLM-generated `calls` edges now have correct direction. The extraction prompt previously never stated that `source` = caller and `target` = callee; the LLM systematically emitted callee→caller edges. An explicit direction rule was added to the prompt. Separately, ghost-node merge was extended to collapse LLM duplicate nodes (bare-stem IDs) onto AST canonical nodes (parent-qualified IDs) even when the LLM node carries a `source_location` — the old check only caught `source_location=None` ghosts. Post-fix annotation: `calls` precision 100% (n=6), overall INFERRED precision 94% (n=16).
@@ -75,6 +88,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## 0.8.33 (2026-06-06)
 
+- Feat: FalkorDB export backend — sibling to Neo4j, selected via `graphify export falkordb [--push falkordb://localhost:6379]`. FalkorDB is OpenCypher-compatible, so the MERGE/SET upsert queries match the Neo4j path; auth is optional and the target graph defaults to `graphify`. Install with `uv tool install "graphifyy[falkordb]"` (#1175).
 - Feat: install banner — `graphify install` now prints an amber knowledge-graph brain in the terminal (TTY-only, silent in CI/pipes, never raises).
 - Fix: Python `from pkg import submod` package-form imports now resolve to a file-level `imports_from` edge to the submodule file when it exists on disk. Previously these imports produced zero edges, leaving test files as disconnected islands in the graph (up to 66% of test nodes in some corpora). The fix lives in the symbol-resolution post-pass which has filesystem access (#1146).
 - Fix: builtin type-annotation nodes (`str`, `int`, `bool`, `float`, `bytes`, `MagicMock`, `Mock`, `AsyncMock`, etc.) no longer appear as graph nodes or accumulate edges. They were being created via the annotation walker whenever used as parameter or return types, inflating degree counts ~25% and displacing real abstractions from god-node rankings. A new `_PYTHON_ANNOTATION_NOISE` filter suppresses them at extraction time; `god_nodes` also filters them as a defense for pre-existing graphs (#1147).
