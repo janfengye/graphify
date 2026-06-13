@@ -7421,9 +7421,14 @@ def _parse_js_tree(path: Path):
 
 
 def _walk_js_tree(node):
-    yield node
-    for child in node.children:
-        yield from _walk_js_tree(child)
+    # Iterative DFS avoids Python's O(depth) generator-chain overhead.
+    # Recursive yield-from creates one generator frame per level — at 26+
+    # levels deep each leaf's value had to propagate through 26 frames.
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(reversed(n.children))
 
 
 def _js_module_specifier(node, source: bytes) -> str | None:
@@ -11559,6 +11564,14 @@ def _extract_parallel(
                 pass
         cpu_cap = env_cap if env_cap is not None else (os.cpu_count() or 4)
         max_workers = min(cpu_cap, len(uncached_work))
+
+    # Windows ProcessPoolExecutor hard-caps at 61 workers (CPython limitation
+    # tied to WaitForMultipleObjects). Clamp here so every path — auto-compute,
+    # GRAPHIFY_MAX_WORKERS, and --max-workers — stays valid on >61-core boxes
+    # (issue #1298). Guard against 0 from an empty work list.
+    if sys.platform == "win32":
+        max_workers = min(max_workers, 61)
+    max_workers = max(max_workers, 1)
 
     root_str = str(effective_root)
     work_items = [(idx, str(path), root_str) for idx, path in uncached_work]
