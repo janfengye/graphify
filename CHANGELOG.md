@@ -4,6 +4,12 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Fix: `graphify query`, `graphify explain`, and MCP `query_graph`/`get_node` now show the human-readable community name (e.g. "FlashAttention Paper") instead of a blank or numeric ID after running `cluster-only`. `to_json` now accepts `community_labels` and embeds `community_name` on each node; read paths fall back to the numeric `community` field for backward compatibility with old graphs (#1305).
+- Fix: `graphify-mcp` and `python -m graphify.serve` now accept `--graph <path>` as an alias for the positional argument, consistent with every other graphify subcommand. Previously `--graph` raised "unrecognized arguments" (#1304).
+
+- CI: bandit (MEDIUM+ severity) and pip-audit security scans added as a non-blocking `security-scan` job. Both run with `continue-on-error: true` so they never break CI — advisory signal only, with the intent to remove the gate once pre-existing findings are triaged.
+- Docs: RFC for file-level node summaries added (`docs/node-summaries-rfc.md`). Proposes inline `graph.json` attribute vs sidecar storage options with pros/cons, phased implementation plan, and open questions for maintainer decision.
+
 - Fix: AST extraction no longer crashes on Windows machines with >61 logical cores. `ProcessPoolExecutor` on Windows is hard-capped at 61 workers via `WaitForMultipleObjects`; the clamp now applies to all three input paths (auto-compute, `GRAPHIFY_MAX_WORKERS`, `--max-workers`) (#1298).
 - Fix: ghost-merge skips ambiguous `(basename, label)` collisions where two AST nodes share the same key. When same-named symbols appear in same-named files across different directories (e.g. two `render()` in two `index.ts`), the previous last-writer-wins produced an arbitrary canonical node and mis-pointed all edges. Ambiguous keys are now tracked and skipped (#1257).
 - Fix: startup no longer crashes on unreadable `.graphify_version` files. On restricted-permission installs or network mounts, `.exists()` / `.read_text()` raised `PermissionError` and crashed every `graphify query/explain/path` call. All three FS probes now wrapped in `try/except OSError: return` (#1299).
