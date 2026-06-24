@@ -538,6 +538,11 @@ graphify install  # overwrites the skill file
 /graphify path "DigestAuth" "Response"
 /graphify explain "SwinTransformer"
 
+graphify save-result --question "Q" --answer "A" --nodes Foo Bar --outcome useful   # record how a Q&A turned out (work memory; outcome ∈ useful|dead_end|corrected)
+graphify reflect                   # aggregate graphify-out/memory/ outcomes into reflections/LESSONS.md
+graphify reflect --out docs/LESSONS.md    # write the lessons doc somewhere else
+graphify reflect --graph graphify-out/graph.json  # also group lessons by community
+
 graphify uninstall                 # remove from all platforms in one shot
 graphify uninstall --purge         # also delete graphify-out/
 graphify uninstall --project --platform codex  # remove project-scoped install files only
