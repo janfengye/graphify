@@ -2343,8 +2343,15 @@ _SWIFT_CONFIG = LanguageConfig(
 
 # ── Generic extractor ─────────────────────────────────────────────────────────
 
-def _extract_generic(path: Path, config: LanguageConfig) -> dict:
-    """Generic AST extractor driven by LanguageConfig."""
+def _extract_generic(
+    path: Path, config: LanguageConfig, *, source_override: bytes | None = None
+) -> dict:
+    """Generic AST extractor driven by LanguageConfig.
+
+    ``source_override`` parses the given bytes instead of reading ``path``, while
+    still keying nodes/edges off ``path``. Lets container formats (e.g. Vue SFCs)
+    mask the wrapper and parse just the embedded ``<script>``.
+    """
     try:
         mod = importlib.import_module(config.ts_module)
         from tree_sitter import Language, Parser
@@ -2371,7 +2378,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
 
     try:
         parser = Parser(language)
-        source = path.read_bytes()
+        source = path.read_bytes() if source_override is None else source_override
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:
@@ -4231,6 +4238,123 @@ def extract_astro(path: Path) -> dict:
                     "source_file": str(path),
                 })
                 existing_ids.add(node_id)
+    except Exception:
+        pass
+    return result
+
+
+# The open-tag matcher skips over quoted attribute values so a `>` inside one
+# (e.g. Vue 3.3+ generic components: `<script setup lang="ts"
+# generic="T extends Record<string, unknown>">`) doesn't prematurely end the tag.
+_VUE_SCRIPT_RE = re.compile(
+    r"""(<script\b(?:"[^"]*"|'[^']*'|[^>"'])*>)([\s\S]*?)(</script\s*>)""",
+    re.IGNORECASE,
+)
+_VUE_SCRIPT_LANG_RE = re.compile(
+    r"""\blang\s*=\s*['"]?([A-Za-z]+)['"]?""", re.IGNORECASE
+)
+
+
+def _vue_mask_non_script(src: str) -> tuple[str, str | None]:
+    """Blank everything outside ``<script>`` bodies, keeping ``\\r``/``\\n``.
+
+    Replaces template/style/tags with spaces so a JS/TS grammar sees only the
+    script, while preserved newlines keep line numbers accurate. Returns
+    ``(masked_source, lang)``; ``lang`` is the first block's declared ``lang``.
+    """
+    def _blank(s: str) -> str:
+        return re.sub(r"[^\r\n]", " ", s)
+
+    out: list[str] = []
+    pos = 0
+    lang: str | None = None
+    for m in _VUE_SCRIPT_RE.finditer(src):
+        out.append(_blank(src[pos:m.start()]))  # markup/style before this block
+        out.append(_blank(m.group(1)))           # <script …> open tag
+        out.append(m.group(2))                   # script body, verbatim
+        out.append(_blank(m.group(3)))           # </script> close tag
+        pos = m.end()
+        if lang is None:
+            lang_m = _VUE_SCRIPT_LANG_RE.search(m.group(1))
+            if lang_m:
+                lang = lang_m.group(1).lower()
+    out.append(_blank(src[pos:]))
+    return "".join(out), lang
+
+
+def extract_vue(path: Path) -> dict:
+    """Extract imports, symbols, and type refs from a ``.vue`` SFC.
+
+    Masks the non-``<script>`` regions and parses the script with the grammar
+    its ``lang`` implies (``tsx``→TSX, ``js``/``jsx``→JS, ``ts`` or unset→TS;
+    TS is a superset of JS so it is a safe default). A regex pass then recovers
+    ``import('…')`` dynamic imports the AST does not edge.
+    """
+    try:
+        src = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"nodes": [], "edges": []}
+
+    masked, lang = _vue_mask_non_script(src)
+    if lang == "tsx":
+        config = _TSX_CONFIG
+    elif lang in ("js", "jsx"):
+        config = _JS_CONFIG
+    else:  # "ts" or unspecified — default to the TS grammar (superset of JS)
+        config = _TS_CONFIG
+
+    result = _extract_generic(path, config, source_override=masked.encode("utf-8"))
+
+    # Dynamic `import('…')` calls aren't edged by the AST pass; recover by regex,
+    # mirroring extract_svelte/extract_astro.
+    try:
+        existing_ids = {n["id"] for n in result.get("nodes", [])}
+        file_node_id = _make_id(str(path))
+        aliases = _load_tsconfig_aliases(path.parent)
+        for m in re.finditer(r"""import\(\s*['"]([^'"]+)['"]\s*\)""", src):
+            raw = m.group(1)
+            if not raw:
+                continue
+            if raw.startswith("."):
+                resolved = Path(os.path.normpath(path.parent / raw))
+                resolved = _resolve_js_module_path(resolved)
+                node_id = _make_id(str(resolved))
+                stub_source_file = str(resolved)
+            else:
+                resolved_alias = None
+                for alias_prefix, alias_base in aliases.items():
+                    if raw == alias_prefix or raw.startswith(alias_prefix + "/"):
+                        rest = raw[len(alias_prefix):].lstrip("/")
+                        resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
+                        break
+                if resolved_alias is not None:
+                    resolved_alias = _resolve_js_module_path(resolved_alias)
+                    node_id = _make_id(str(resolved_alias))
+                    stub_source_file = str(resolved_alias)
+                else:
+                    module_name = raw.split("/")[-1]
+                    if not module_name:
+                        continue
+                    node_id = _make_id(module_name)
+                    stub_source_file = raw
+            if node_id in existing_ids:
+                result.setdefault("edges", []).append({
+                    "source": file_node_id, "target": node_id,
+                    "relation": "dynamic_import", "confidence": "EXTRACTED",
+                    "source_file": str(path),
+                })
+                continue
+            result.setdefault("nodes", []).append({
+                "id": node_id, "label": raw,
+                "file_type": "code", "source_file": stub_source_file,
+                "confidence": "EXTRACTED",
+            })
+            result.setdefault("edges", []).append({
+                "source": file_node_id, "target": node_id,
+                "relation": "dynamic_import", "confidence": "EXTRACTED",
+                "source_file": str(path),
+            })
+            existing_ids.add(node_id)
     except Exception:
         pass
     return result
@@ -7823,13 +7947,25 @@ def _apply_symbol_resolution_facts(
 def _parse_js_tree(path: Path):
     try:
         from tree_sitter import Language, Parser
-        if path.suffix in (".ts", ".tsx"):
+        # .vue embeds the script in non-JS markup; mask it out and parse the
+        # <script> with TS.
+        vue_lang: str | None = None
+        if path.suffix == ".vue":
+            masked, vue_lang = _vue_mask_non_script(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+            source = masked.encode("utf-8")
+        else:
+            source = path.read_bytes()
+        use_ts = path.suffix in (".ts", ".tsx") or (
+            path.suffix == ".vue" and vue_lang not in ("js", "jsx")
+        )
+        if use_ts:
             import tree_sitter_typescript as tstypescript
             language = Language(tstypescript.language_typescript())
         else:
             import tree_sitter_javascript as tsjavascript
             language = Language(tsjavascript.language())
-        source = path.read_bytes()
         parser = Parser(language)
         return source, parser.parse(source).root_node
     except Exception:
@@ -8174,7 +8310,7 @@ def _ts_walk_class_members(class_node, source: bytes, path: Path, class_nid: str
 def _collect_js_symbol_resolution_facts(paths: list[Path], facts: _SymbolResolutionFacts) -> None:
     js_paths = [
         path for path in paths
-        if path.suffix in _JS_CACHE_BYPASS_SUFFIXES and path.suffix != ".vue"
+        if path.suffix in _JS_CACHE_BYPASS_SUFFIXES
     ]
     if not js_paths:
         return
@@ -11060,6 +11196,84 @@ _XAML_NON_EVENT_ATTRS = frozenset({
 # markup, a path, or a sentence. Used to skip values like "{Binding ...}" or
 # free-form content before looking them up as code-behind methods.
 _XAML_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_XAML_DESIGN_INSTANCE_TYPE_RE = re.compile(
+    r"\bType\s*=\s*(?:\{x:Type\s+)?(?P<type>[\w.:+]+)"
+)
+
+
+def _xaml_markup_extension(value: str) -> tuple[str, str] | None:
+    value = value.strip()
+    if not (value.startswith("{") and value.endswith("}")):
+        return None
+    inner = value[1:-1].strip()
+    if not inner or inner.startswith("}"):
+        return None
+    name, _, args = inner.partition(" ")
+    return name, args.strip()
+
+
+def _xaml_split_markup_args(args: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    for idx, ch in enumerate(args):
+        if ch == "{":
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(args[start:idx].strip())
+            start = idx + 1
+    tail = args[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _xaml_static_resource_key(value: str) -> str | None:
+    markup = _xaml_markup_extension(value)
+    if not markup:
+        return None
+    name, args = markup
+    if name != "StaticResource":
+        return None
+    for part in _xaml_split_markup_args(args):
+        if "=" not in part:
+            return part.strip() or None
+        key, resource = part.split("=", 1)
+        if key.strip() == "ResourceKey":
+            return resource.strip() or None
+    return None
+
+
+def _xaml_binding_refs(value: str) -> tuple[str | None, str | None]:
+    markup = _xaml_markup_extension(value)
+    if not markup:
+        return None, None
+    name, args = markup
+    if name != "Binding":
+        return None, None
+
+    path_ref = None
+    converter_ref = None
+    for part in _xaml_split_markup_args(args):
+        if not part:
+            continue
+        if "=" not in part:
+            if path_ref is None:
+                path_ref = part.strip()
+            continue
+        key, raw_value = part.split("=", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if key == "Path":
+            path_ref = raw_value
+        elif key == "Converter":
+            converter_ref = _xaml_static_resource_key(raw_value)
+
+    if path_ref and ("{" in path_ref or "}" in path_ref):
+        path_ref = None
+    return path_ref or None, converter_ref or None
 
 
 def _xaml_codebehind_path(path: Path) -> Path | None:
@@ -11132,6 +11346,207 @@ def _xaml_codebehind_symbols(
         if label.startswith(".") and label.endswith("()") and _has_event_handler_signature(node):
             methods[label.strip("()").lstrip(".")] = node
     return class_node, methods, class_method_edges
+
+
+def _xaml_type_simple_name(type_ref: str) -> str | None:
+    type_ref = type_ref.strip().strip("{}")
+    if not type_ref:
+        return None
+    type_ref = type_ref.split(",", 1)[0].strip()
+    if type_ref.startswith("x:Type "):
+        type_ref = type_ref[len("x:Type "):].strip()
+    if ":" in type_ref:
+        type_ref = type_ref.rsplit(":", 1)[-1]
+    if "." in type_ref:
+        type_ref = type_ref.rsplit(".", 1)[-1]
+    if "+" in type_ref:
+        type_ref = type_ref.rsplit("+", 1)[-1]
+    return type_ref if _XAML_IDENT_RE.fullmatch(type_ref) else None
+
+
+def _xaml_explicit_viewmodel_names(tree) -> tuple[bool, list[str]]:
+    has_data_context = False
+    names: list[str] = []
+    for elem in tree.iter():
+        elem_type = _xml_local_name(elem.tag)
+        if elem_type.endswith(".DataContext") or elem_type == "DataContext":
+            has_data_context = True
+            for child in list(elem):
+                vm_name = _xaml_type_simple_name(_xml_local_name(child.tag))
+                if vm_name and vm_name not in names:
+                    names.append(vm_name)
+        for key, value in elem.attrib.items():
+            if _xml_local_name(key) != "DataContext" or not value:
+                continue
+            has_data_context = True
+            match = _XAML_DESIGN_INSTANCE_TYPE_RE.search(value)
+            if match:
+                vm_name = _xaml_type_simple_name(match.group("type"))
+                if vm_name and vm_name not in names:
+                    names.append(vm_name)
+    return has_data_context, names
+
+
+def _xaml_prism_autowire_viewmodel(tree) -> bool:
+    for elem in tree.iter():
+        for key, value in elem.attrib.items():
+            if (
+                _xml_local_name(key).endswith("ViewModelLocator.AutoWireViewModel")
+                and value.strip().lower() == "true"
+            ):
+                return True
+    return False
+
+
+def _xaml_inferred_viewmodel_names(view_name: str | None) -> list[str]:
+    if not view_name:
+        return []
+    names: list[str] = []
+
+    def add(name: str) -> None:
+        if name.endswith("ViewModel") and name not in names:
+            names.append(name)
+
+    if view_name == "MainWindow":
+        add("MainWindowViewModel")
+        add("MainViewModel")
+    for suffix in ("UserControl", "View", "Page", "Control"):
+        if view_name.endswith(suffix) and len(view_name) > len(suffix):
+            add(view_name[:-len(suffix)] + "ViewModel")
+            break
+    return names
+
+
+def _xaml_project_root(path: Path) -> Path:
+    project_markers = (".csproj", ".fsproj", ".vbproj", ".sln", ".slnx")
+    root = path.parent
+    for directory in (path.parent, *path.parent.parents):
+        try:
+            if any(child.suffix in project_markers for child in directory.iterdir()):
+                root = directory
+                break
+        except OSError:
+            continue
+    if _XAML_ACTIVE_EXTRACT_ROOT is None:
+        return root
+    boundary = _XAML_ACTIVE_EXTRACT_ROOT.resolve()
+    try:
+        root.resolve().relative_to(boundary)
+        return root
+    except ValueError:
+        return boundary
+
+
+def _xaml_csharp_class_nodes(path: Path) -> dict[str, list[dict]]:
+    from graphify.detect import _is_ignored, _is_noise_dir, _load_graphifyignore
+    root = _xaml_project_root(path)
+    cache_key = str(root.resolve()) if _XAML_ACTIVE_EXTRACT_ROOT is not None else None
+    if cache_key and cache_key in _XAML_CSHARP_CLASS_CACHE:
+        return _XAML_CSHARP_CLASS_CACHE[cache_key]
+    classes: dict[str, list[dict]] = {}
+    patterns = _load_graphifyignore(root)
+    ignore_cache: dict[Path, bool] = {}
+    try:
+        cs_files = sorted(root.rglob("*.cs"))
+    except OSError:
+        return classes
+    for cs_path in cs_files:
+        if any(_is_noise_dir(part) for part in cs_path.parts):
+            continue
+        if patterns and _is_ignored(cs_path, root, patterns, _cache=ignore_cache):
+            continue
+        result = extract_csharp(cs_path)
+        if result.get("error"):
+            continue
+        for node in result.get("nodes", []):
+            label = str(node.get("label", ""))
+            if not label.endswith("ViewModel") or not _XAML_IDENT_RE.fullmatch(label):
+                continue
+            if node.get("source_file"):
+                classes.setdefault(label, []).append(node)
+    if cache_key:
+        _XAML_CSHARP_CLASS_CACHE[cache_key] = classes
+    return classes
+
+
+def _xaml_pascal_name(name: str) -> str | None:
+    name = name.strip().lstrip("_")
+    if name.startswith("m_"):
+        name = name[2:]
+    return name[:1].upper() + name[1:] if _XAML_IDENT_RE.fullmatch(name) else None
+
+
+_XAML_TOOLKIT_FIELD_RE = re.compile(r"\b(?P<name>_?m?_?[A-Za-z_]\w*)\s*(?:=.*)?;")
+_XAML_TOOLKIT_METHOD_RE = re.compile(r"\b(?P<name>[A-Za-z_]\w*)\s*\(")
+_XAML_ACTIVE_EXTRACT_ROOT: Path | None = None
+_XAML_CSHARP_CLASS_CACHE: dict[str, dict[str, list[dict]]] = {}
+
+
+def _xaml_communitytoolkit_members(vm_node: dict) -> tuple[dict[str, dict], list[dict]]:
+    source_file = vm_node.get("source_file")
+    vm_id = vm_node.get("id")
+    if not source_file or not vm_id:
+        return {}, []
+    try:
+        # errors="replace" so a non-UTF8 code-behind can't raise UnicodeDecodeError
+        # and abort the whole extract_xaml (matches every other reader here).
+        lines = Path(source_file).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}, []
+
+    members: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    def add_member(label: str, line_no: int, context: str) -> None:
+        nid = _make_id(vm_id, label)
+        members[label] = {
+            "id": nid,
+            "label": label,
+            "file_type": "code",
+            "source_file": source_file,
+            "source_location": f"L{line_no}",
+        }
+        edges.append({
+            "source": vm_id,
+            "target": nid,
+            "relation": "defines",
+            "confidence": "INFERRED",
+            "source_file": source_file,
+            "source_location": f"L{line_no}",
+            "weight": 1.0,
+            "context": context,
+        })
+
+    pending: tuple[str, int] | None = None
+    for line_no, line in enumerate(lines, 1):
+        remainder = line.split("]", 1)[1].strip() if "]" in line else ""
+        if "[" in line and "ObservableProperty" in line:
+            pending = ("property", line_no)
+            if not remainder:
+                continue
+            line = remainder
+        if "[" in line and "RelayCommand" in line:
+            pending = ("command", line_no)
+            if not remainder:
+                continue
+            line = remainder
+        if not pending or not line.strip() or line.lstrip().startswith("["):
+            continue
+
+        kind, attr_line = pending
+        pending = None
+        if kind == "property":
+            match = _XAML_TOOLKIT_FIELD_RE.search(line)
+            label = _xaml_pascal_name(match.group("name")) if match else None
+            if label:
+                add_member(label, attr_line, "communitytoolkit_observable_property")
+        else:
+            match = _XAML_TOOLKIT_METHOD_RE.search(line)
+            if match:
+                method = match.group("name").removesuffix("Async")
+                add_member(f"{method}Command", attr_line, "communitytoolkit_relay_command")
+
+    return members, edges
 
 
 def extract_xaml(path: Path) -> dict:
@@ -11207,6 +11622,7 @@ def extract_xaml(path: Path) -> dict:
         *,
         context: str | None = None,
         source_file: str = str_path,
+        confidence: str = "EXTRACTED",
     ) -> None:
         key = (src_nid, tgt_nid, relation, context)
         if key in seen_edges:
@@ -11214,7 +11630,7 @@ def extract_xaml(path: Path) -> dict:
         seen_edges.add(key)
         edge = {
             "source": src_nid, "target": tgt_nid, "relation": relation,
-            "confidence": "EXTRACTED", "source_file": source_file,
+            "confidence": confidence, "source_file": source_file,
             "source_location": f"L{line}", "weight": 1.0,
         }
         if context:
@@ -11249,7 +11665,38 @@ def extract_xaml(path: Path) -> dict:
             add_node(class_nid, class_label, line_for(class_name))
         add_edge(root_nid, class_nid, "references", line_for(class_name), context="x_class")
 
-    binding_re = re.compile(r"\{Binding\s+([^,}\s]+)")
+    has_data_context, vm_names = _xaml_explicit_viewmodel_names(tree)
+    prism_autowire = _xaml_prism_autowire_viewmodel(tree)
+    vm_confidence = "EXTRACTED"
+    if not has_data_context:
+        view_name = class_name.rsplit(".", 1)[-1] if class_name else None
+        view_name = view_name or (path.stem if prism_autowire else None)
+        vm_names = _xaml_inferred_viewmodel_names(view_name)
+        vm_confidence = "INFERRED"
+    generated_members: dict[str, dict] = {}
+    generated_member_edges: list[dict] = []
+    if vm_names:
+        csharp_classes = _xaml_csharp_class_nodes(path)
+        vm_candidates = []
+        for vm_name in vm_names:
+            vm_candidates.extend(csharp_classes.get(vm_name, []))
+        by_id = {node.get("id"): node for node in vm_candidates if node.get("id")}
+        if len(by_id) == 1:
+            vm_node = next(iter(by_id.values()))
+            add_existing_node(vm_node)
+            add_edge(
+                root_nid,
+                vm_node["id"],
+                "references",
+                line_for(vm_node["label"]),
+                context="view_model",
+                confidence=vm_confidence,
+            )
+            generated_members, generated_member_edges = _xaml_communitytoolkit_members(vm_node)
+            for member in generated_members.values():
+                add_existing_node(member)
+            for member_edge in generated_member_edges:
+                add_existing_edge(member_edge)
 
     for elem in tree.iter():
         elem_type = _xml_local_name(elem.tag)
@@ -11286,13 +11733,43 @@ def extract_xaml(path: Path) -> dict:
                             add_existing_node(class_node)
                             add_existing_edge(method_edge)
                             break
-            for match in binding_re.finditer(value):
-                binding = match.group(1).strip()
-                if not binding:
-                    continue
-                bind_nid = _make_id("binding", binding)
-                add_node(bind_nid, binding, line_for(value), file_type="concept")
-                add_edge(owner_nid, bind_nid, "references", line_for(value), context="binding")
+            binding_path, binding_converter = _xaml_binding_refs(value)
+            if binding_path:
+                bind_nid = _make_id("binding", binding_path)
+                add_node(bind_nid, binding_path, line_for(value), file_type="concept")
+                binding_context = (
+                    "binding_command"
+                    if attr_local == "Command" or attr_local.endswith(".Command")
+                    else "binding_path"
+                )
+                add_edge(owner_nid, bind_nid, "references", line_for(value), context=binding_context)
+                generated_member = generated_members.get(binding_path)
+                if generated_member:
+                    add_existing_node(generated_member)
+                    add_edge(
+                        owner_nid,
+                        generated_member["id"],
+                        "references",
+                        line_for(value),
+                        context=binding_context,
+                        confidence="INFERRED",
+                    )
+            if binding_converter:
+                converter_nid = _make_id("binding_converter", binding_converter)
+                add_node(converter_nid, binding_converter, line_for(value), file_type="concept")
+                add_edge(owner_nid, converter_nid, "references", line_for(value), context="binding_converter")
+            if elem_type == "Binding" and attr_local == "Path":
+                direct_path = value.strip()
+                if direct_path and "{" not in direct_path and "}" not in direct_path:
+                    bind_nid = _make_id("binding", direct_path)
+                    add_node(bind_nid, direct_path, line_for(value), file_type="concept")
+                    add_edge(owner_nid, bind_nid, "references", line_for(value), context="binding_path")
+            if elem_type == "Binding" and attr_local == "Converter":
+                direct_converter = _xaml_static_resource_key(value)
+                if direct_converter:
+                    converter_nid = _make_id("binding_converter", direct_converter)
+                    add_node(converter_nid, direct_converter, line_for(value), file_type="concept")
+                    add_edge(owner_nid, converter_nid, "references", line_for(value), context="binding_converter")
 
     return {"nodes": nodes, "edges": edges}
 
@@ -12243,7 +12720,7 @@ _DISPATCH: dict[str, Any] = {
     ".F03": extract_fortran,
     ".f08": extract_fortran,
     ".F08": extract_fortran,
-    ".vue": extract_js,
+    ".vue": extract_vue,
     ".svelte": extract_svelte,
     ".astro": extract_astro,
     ".dart": extract_dart,
@@ -12304,6 +12781,16 @@ def _get_extractor(path: Path) -> Any | None:
     return _DISPATCH.get(path.suffix)
 
 
+def _safe_extract_with_xaml_root(extractor, path: Path, root: Path) -> dict:
+    global _XAML_ACTIVE_EXTRACT_ROOT
+    previous_root = _XAML_ACTIVE_EXTRACT_ROOT
+    _XAML_ACTIVE_EXTRACT_ROOT = root.resolve()
+    try:
+        return _safe_extract(extractor, path)
+    finally:
+        _XAML_ACTIVE_EXTRACT_ROOT = previous_root
+
+
 def _extract_single_file(args: tuple) -> tuple[int, dict]:
     """Worker function for parallel extraction. Runs in a subprocess.
 
@@ -12332,7 +12819,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     if extractor is None:
         return idx, {"nodes": [], "edges": []}
 
-    result = _safe_extract(extractor, path)
+    result = _safe_extract_with_xaml_root(extractor, path, cache_root)
     if not bypass_cache and "error" not in result:
         save_cached(path, result, cache_root)
     return idx, result
@@ -12456,7 +12943,7 @@ def _extract_sequential(
             per_file[idx] = {"nodes": [], "edges": []}
             continue
         bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
-        result = _safe_extract(extractor, path)
+        result = _safe_extract_with_xaml_root(extractor, path, effective_root)
         if not bypass_cache and "error" not in result:
             save_cached(path, result, effective_root)
         per_file[idx] = result
@@ -12496,6 +12983,7 @@ def extract(
     _raise_recursion_limit()
     # Workspace package manifests/globs can change during watch or repeated extraction.
     _WORKSPACE_PACKAGE_CACHE.clear()
+    _XAML_CSHARP_CLASS_CACHE.clear()
 
     # Infer a common root for cache keys (use first diverging segment, not sum of all matches)
     try:
