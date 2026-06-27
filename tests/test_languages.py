@@ -257,6 +257,27 @@ def test_cuda_host_call_edges():
     assert ("main()", "host_norm()") in calls
 
 
+# Metal Shading Language is a C++14-derived language, so .metal files route
+# through the C++ extractor just like CUDA does.
+
+def test_metal_is_code_extension():
+    from graphify.detect import CODE_EXTENSIONS
+    assert ".metal" in CODE_EXTENSIONS
+
+
+def test_metal_no_error():
+    r = extract_cpp(FIXTURES / "sample.metal")
+    assert "error" not in r
+
+
+def test_metal_finds_kernel_function_and_struct():
+    r = extract_cpp(FIXTURES / "sample.metal")
+    labels = _labels(r)
+    assert any("Vec3" in l for l in labels)
+    assert any("dot3" in l for l in labels)
+    assert any("saxpy" in l for l in labels)
+
+
 # ── Ruby ─────────────────────────────────────────────────────────────────────
 
 def test_ruby_no_error():
@@ -342,6 +363,40 @@ def test_java_parameter_return_generic_and_attribute_contexts():
     assert ("build", "Result") in _edge_labels(result, "references", "return_type")
     assert ("build", "DataProcessor") in _edge_labels(result, "references", "generic_arg")
     assert ("build", "Override") in _edge_labels(result, "references", "attribute")
+
+
+def test_java_field_type_references_have_field_context(tmp_path):
+    source = tmp_path / "Fields.java"
+    source.write_text(
+        "class PaymentGateway {}\n"
+        "class Handler {}\n"
+        "class CheckoutService {\n"
+        "    PaymentGateway gateway;\n"
+        "    List<Handler> handlers;\n"
+        "}\n"
+    )
+    result = extract_java(source)
+    assert ("CheckoutService", "PaymentGateway") in _edge_labels(
+        result, "references", "field"
+    )
+    assert ("CheckoutService", "Handler") in _edge_labels(
+        result, "references", "generic_arg"
+    )
+
+
+def test_java_type_annotations_have_attribute_context(tmp_path):
+    source = tmp_path / "TypeAnnotations.java"
+    source.write_text(
+        '@Service\n'
+        '@Entity(name = "checkout")\n'
+        'class CheckoutService {}\n'
+    )
+
+    result = extract_java(source)
+
+    refs = _edge_labels(result, "references", "attribute")
+    assert ("CheckoutService", "Service") in refs
+    assert ("CheckoutService", "Entity") in refs
 
 
 def test_csharp_field_type_references_have_field_context():

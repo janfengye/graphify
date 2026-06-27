@@ -684,11 +684,11 @@ def _java_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[
                 _java_collect_type_refs(c, source, generic, out)
 
 
-def _java_method_annotation_names(method_node, source: bytes) -> list[str]:
-    """Collect annotation names from a Java method's `modifiers` child."""
+def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
+    """Collect annotation names from a Java declaration's `modifiers` child."""
     names: list[str] = []
     modifiers = None
-    for child in method_node.children:
+    for child in declaration_node.children:
         if child.type == "modifiers":
             modifiers = child
             break
@@ -2792,6 +2792,12 @@ def _extract_generic(
                                         if tid.type == "type_identifier":
                                             _emit_java_parent(_read_text(tid, source), "inherits", line)
 
+                for anno_name in _java_annotation_names(node, source):
+                    target_nid = ensure_named_node(anno_name, line)
+                    if target_nid != class_nid:
+                        add_edge(class_nid, target_nid, "references", line,
+                                 context="attribute")
+
             # Scala: extends_clause carries `extends Base with Trait1 with Trait2`.
             # The first base after `extends` is `inherits`; each subsequent
             # type after `with` is `mixes_in`. Also walk class_parameters for
@@ -2962,6 +2968,22 @@ def _extract_generic(
                 line = node.start_point[0] + 1
                 add_edge(parent_class_nid, ensure_named_node(type_name, line),
                          "references", line, context="field")
+            return
+
+        if (config.ts_module == "tree_sitter_java"
+                and t == "field_declaration"
+                and parent_class_nid):
+            type_node = node.child_by_field_name("type")
+            if type_node is not None:
+                line = node.start_point[0] + 1
+                refs: list[tuple[str, str]] = []
+                _java_collect_type_refs(type_node, source, False, refs)
+                for ref_name, role in refs:
+                    ctx = "generic_arg" if role == "generic_arg" else "field"
+                    target_nid = ensure_named_node(ref_name, line)
+                    if target_nid != parent_class_nid:
+                        add_edge(parent_class_nid, target_nid, "references",
+                                 line, context=ctx)
             return
 
         if (config.ts_module == "tree_sitter_php"
@@ -3190,7 +3212,7 @@ def _extract_generic(
                         target_nid = ensure_named_node(ref_name, line)
                         if target_nid != func_nid:
                             add_edge(func_nid, target_nid, "references", line, context=ctx)
-                for anno_name in _java_method_annotation_names(node, source):
+                for anno_name in _java_annotation_names(node, source):
                     target_nid = ensure_named_node(anno_name, line)
                     if target_nid != func_nid:
                         add_edge(func_nid, target_nid, "references", line, context="attribute")
@@ -12728,6 +12750,7 @@ _DISPATCH: dict[str, Any] = {
     ".hpp": extract_cpp,
     ".cu": extract_cpp,
     ".cuh": extract_cpp,
+    ".metal": extract_cpp,
     ".rb": extract_ruby,
     ".cs": extract_csharp,
     ".kt": extract_kotlin,
