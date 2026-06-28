@@ -22,6 +22,7 @@ from graphify.extractors.base import (  # noqa: F401
     _read_text,
 )
 from graphify.extractors.blade import extract_blade  # noqa: F401
+from graphify.extractors.csharp import _resolve_csharp_type_references
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.razor import extract_razor  # noqa: F401
 from graphify.extractors.zig import extract_zig  # noqa: F401
@@ -2131,7 +2132,13 @@ _RUBY_CONFIG = LanguageConfig(
 
 _CSHARP_CONFIG = LanguageConfig(
     ts_module="tree_sitter_c_sharp",
-    class_types=frozenset({"class_declaration", "interface_declaration"}),
+    class_types=frozenset({
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "struct_declaration",
+        "record_declaration",
+    }),
     function_types=frozenset({"method_declaration"}),
     import_types=frozenset({"using_directive"}),
     call_types=frozenset({"invocation_expression"}),
@@ -2461,6 +2468,7 @@ def _extract_generic(
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
+                "origin_file": str_path,
             })
         return nid
 
@@ -4519,7 +4527,7 @@ def extract_ruby(path: Path) -> dict:
 
 
 def extract_csharp(path: Path) -> dict:
-    """Extract classes, interfaces, methods, namespaces, and usings from a .cs file."""
+    """Extract C# type declarations, methods, namespaces, and usings from a .cs file."""
     return _extract_generic(path, _CSHARP_CONFIG)
 
 
@@ -6472,7 +6480,21 @@ def extract_go(path: Path) -> dict:
             return nid
         nid = _make_id(name)
         if nid not in seen_ids:
-            add_node(nid, name, line)
+            # The name isn't declared in this file, so this is a cross-file reference
+            # (e.g. a type defined in another file of the package). Emit a SOURCELESS
+            # stub — like the inheritance-base path in the other extractors — so the
+            # corpus-level rewire can collapse it onto the real definition. A sourced
+            # stub here makes _disambiguate_colliding_node_ids bake the referencing
+            # file's path (with extension) into the id and blocks the rewire, which is
+            # the phantom-duplicate-node bug (#1402).
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid,
+                "label": name,
+                "file_type": "code",
+                "source_file": "",
+                "source_location": "",
+            })
         return nid
 
     def emit_go_method_refs(func_node, func_nid: str, line: int) -> None:
@@ -7539,6 +7561,13 @@ def _source_key(source_file: str, root: Path) -> str:
         return str(source_path)
 
 
+def _node_disambiguation_source_key(node: dict, root: Path) -> str:
+    source_file = str(node.get("source_file", ""))
+    if source_file:
+        return _source_key(source_file, root)
+    return _source_key(str(node.get("origin_file", "")), root)
+
+
 def _disambiguate_colliding_node_ids(
     nodes: list[dict],
     edges: list[dict],
@@ -7564,12 +7593,12 @@ def _disambiguate_colliding_node_ids(
     remap: dict[tuple[str, str], str] = {}
     ambiguous_ids: set[str] = set()
     for old_id, group in by_id.items():
-        source_keys = {_source_key(str(node.get("source_file", "")), root) for node in group}
+        source_keys = {_node_disambiguation_source_key(node, root) for node in group}
         if len(group) < 2 or len(source_keys) < 2:
             continue
         ambiguous_ids.add(old_id)
         for node in group:
-            source_key = _source_key(str(node.get("source_file", "")), root)
+            source_key = _node_disambiguation_source_key(node, root)
             if not source_key:
                 continue
             new_id = _make_id(source_key, old_id)
@@ -13247,6 +13276,18 @@ def extract(
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Java type-reference resolution failed, skipping: %s", exc)
+
+    # Cross-file C# type-reference resolution: re-point dangling inherits/implements/
+    # references edges left on shadow stubs, disambiguating same-named types by the
+    # referencing file's `using` directives + enclosing namespace (mirrors Java #1318).
+    cs_paths = [p for p in paths if p.suffix == ".cs"]
+    if cs_paths:
+        cs_results = [r for r, p in zip(per_file, paths) if p.suffix == ".cs"]
+        try:
+            _resolve_csharp_type_references(cs_results, cs_paths, all_nodes, all_edges)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("C# type-reference resolution failed, skipping: %s", exc)
 
     # Cross-file call resolution for all languages
     # Each extractor saved unresolved calls in raw_calls. Now that we have all

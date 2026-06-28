@@ -123,6 +123,54 @@ def test_cross_file_type_annotation_refs_resolve_to_single_node(tmp_path):
     assert "_py" not in thing_nodes[0]["id"], thing_nodes[0]["id"]
 
 
+def test_go_cross_file_type_refs_resolve_to_single_node(tmp_path):
+    """#1402 (Go): the sourceless-stub fix landed in six extractors but the Go copy
+    of ``ensure_named_node`` was missed, so a Go type defined once but referenced via
+    parameter/return types in N sibling files produced 1+N phantom duplicate nodes
+    with the referencing file's path (extension and all) baked into the id
+    (e.g. ``pkg_a_go_thing``). Same-package references must resolve to the single
+    canonical type node instead."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "thing.go").write_text(
+        "package pkg\n\ntype Thing struct{}\n\nfunc (t Thing) Run() int { return 1 }\n",
+        encoding="utf-8",
+    )
+    (pkg / "a.go").write_text(
+        "package pkg\n\nfunc UseA(obj Thing) Thing { return obj }\n", encoding="utf-8"
+    )
+    (pkg / "b.go").write_text(
+        "package pkg\n\nfunc UseB(obj Thing) Thing { return obj }\n", encoding="utf-8"
+    )
+
+    result = extract([pkg / "thing.go", pkg / "a.go", pkg / "b.go"], cache_root=tmp_path)
+
+    thing_nodes = [n for n in result["nodes"] if n["label"] == "Thing"]
+    assert len(thing_nodes) == 1, [n["id"] for n in thing_nodes]
+    # The phantom signature is the referencing file's path (with .go extension)
+    # baked into the id — must not appear.
+    assert "_go" not in thing_nodes[0]["id"], thing_nodes[0]["id"]
+
+
+def test_imported_type_stubs_do_not_collide_across_source_files(tmp_path):
+    """#1462: imported stdlib/type stubs with the same label are distinct uses
+    when there is no single project definition to rewire onto. They need the
+    referencing file as a disambiguator while still keeping ``source_file`` empty
+    so real project definitions can be rewired by #1402."""
+    first = tmp_path / "pkg/a.py"
+    second = tmp_path / "pkg/b.py"
+    first.parent.mkdir(parents=True)
+    first.write_text("from pathlib import Path\ndef use_a(p: Path):\n    return p\n", encoding="utf-8")
+    second.write_text("from pathlib import Path\ndef use_b(p: Path):\n    return p\n", encoding="utf-8")
+
+    result = extract([first, second], cache_root=tmp_path)
+    path_nodes = [node for node in result["nodes"] if node["label"] == "Path"]
+
+    assert len(path_nodes) == 2
+    assert len({node["id"] for node in path_nodes}) == 2
+    assert all(not node.get("source_file") for node in path_nodes)
+
+
 def test_extract_updates_raw_call_callers_after_duplicate_id_disambiguation(tmp_path):
     first = tmp_path / "apps/api/Program.cs"
     second = tmp_path / "tools/api/Program.cs"
