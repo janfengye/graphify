@@ -357,6 +357,28 @@ def test_java_normalizes_inherits_and_implements():
     assert ("DataProcessor", "Processor") in _edge_labels(result, "implements")
 
 
+def test_java_generic_parents_include_type_argument_references(tmp_path):
+    source = tmp_path / "GenericParents.java"
+    source.write_text(
+        "class Dependency {}\n"
+        "interface Event {}\n"
+        "class Base<T> {}\n"
+        "interface Handler<T> {}\n"
+        "interface DerivedHandler extends Handler<Event> {}\n"
+        "class Service extends Base<Dependency> implements Handler<Event> {}\n"
+    )
+
+    result = extract_java(source)
+
+    assert ("Service", "Base") in _edge_labels(result, "inherits")
+    assert ("Service", "Handler") in _edge_labels(result, "implements")
+    refs = _edge_labels(result, "references", "generic_arg")
+    assert ("Service", "Dependency") in refs
+    assert ("Service", "Event") in refs
+    assert ("DerivedHandler", "Handler") in _edge_labels(result, "inherits")
+    assert ("DerivedHandler", "Event") in refs
+
+
 def test_java_parameter_return_generic_and_attribute_contexts():
     result = extract_java(FIXTURES / "sample.java")
     assert ("build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
@@ -397,6 +419,36 @@ def test_java_type_annotations_have_attribute_context(tmp_path):
     refs = _edge_labels(result, "references", "attribute")
     assert ("CheckoutService", "Service") in refs
     assert ("CheckoutService", "Entity") in refs
+
+
+def test_java_enum_and_annotation_declarations_are_type_nodes(tmp_path):
+    source = tmp_path / "TypeDeclarations.java"
+    source.write_text(
+        "enum PaymentStatus { PENDING, PAID }\n"
+        "@interface Audited {}\n"
+        "class Order { PaymentStatus status; }\n"
+        "@Audited class CheckoutService {}\n"
+    )
+
+    result = extract_java(source)
+
+    assert ("TypeDeclarations.java", "PaymentStatus") in _edge_labels(
+        result, "contains"
+    )
+    assert ("TypeDeclarations.java", "Audited") in _edge_labels(result, "contains")
+    assert ("Order", "PaymentStatus") in _edge_labels(
+        result, "references", "field"
+    )
+    assert ("CheckoutService", "Audited") in _edge_labels(
+        result, "references", "attribute"
+    )
+    definitions = {
+        node["label"]: node
+        for node in result["nodes"]
+        if node.get("label") in {"PaymentStatus", "Audited"}
+    }
+    assert definitions["PaymentStatus"].get("source_file") == str(source)
+    assert definitions["Audited"].get("source_file") == str(source)
 
 
 def test_csharp_field_type_references_have_field_context():
