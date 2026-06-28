@@ -1,6 +1,7 @@
 """Deterministic structural extraction from source code using tree-sitter. Outputs nodes+edges dicts."""
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -644,16 +645,54 @@ def _csharp_attribute_names(method_node, source: bytes) -> list[str]:
     return names
 
 
-def _java_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[str, str]]) -> None:
+_JAVA_TYPE_PARAMETER_SCOPE_DECLARATIONS = frozenset({
+    "class_declaration",
+    "interface_declaration",
+    "record_declaration",
+    "method_declaration",
+    "constructor_declaration",
+})
+
+
+def _java_type_parameters_in_scope(node, source: bytes) -> frozenset[str]:
+    """Return Java type-parameter names visible from ``node``."""
+    names: set[str] = set()
+    scope = node
+    while scope is not None:
+        if scope.type in _JAVA_TYPE_PARAMETER_SCOPE_DECLARATIONS:
+            params = scope.child_by_field_name("type_parameters")
+            if params is not None:
+                for param in params.children:
+                    if param.type != "type_parameter":
+                        continue
+                    name_node = next(
+                        (child for child in param.children if child.type == "type_identifier"),
+                        None,
+                    )
+                    if name_node is not None:
+                        names.add(_read_text(name_node, source))
+        scope = scope.parent
+    return frozenset(names)
+
+
+def _java_collect_type_refs(
+    node,
+    source: bytes,
+    generic: bool,
+    out: list[tuple[str, str]],
+    skip: frozenset[str] | None = None,
+) -> None:
     """Walk a Java type expression; append (name, role) tuples."""
     if node is None:
         return
+    if skip is None:
+        skip = _java_type_parameters_in_scope(node, source)
     t = node.type
     if t in ("integral_type", "floating_point_type", "boolean_type", "void_type"):
         return
     if t == "type_identifier":
         name = _read_text(node, source)
-        if name:
+        if name and name not in skip:
             out.append((name, "generic_arg" if generic else "type"))
         return
     if t == "scoped_type_identifier":
@@ -665,24 +704,24 @@ def _java_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple[
         for c in node.children:
             if c.type in ("type_identifier", "scoped_type_identifier"):
                 text = _read_text(c, source).rsplit(".", 1)[-1]
-                if text:
+                if text and (c.type == "scoped_type_identifier" or text not in skip):
                     out.append((text, "generic_arg" if generic else "type"))
                 break
         for c in node.children:
             if c.type == "type_arguments":
                 for arg in c.children:
                     if arg.is_named:
-                        _java_collect_type_refs(arg, source, True, out)
+                        _java_collect_type_refs(arg, source, True, out, skip)
         return
     if t == "array_type":
         for c in node.children:
             if c.is_named:
-                _java_collect_type_refs(c, source, generic, out)
+                _java_collect_type_refs(c, source, generic, out, skip)
         return
     if node.is_named:
         for c in node.children:
             if c.is_named:
-                _java_collect_type_refs(c, source, generic, out)
+                _java_collect_type_refs(c, source, generic, out, skip)
 
 
 def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
@@ -2823,6 +2862,34 @@ def _extract_generic(
                     if target_nid != class_nid:
                         add_edge(class_nid, target_nid, "references", line,
                                  context="attribute")
+
+                if t == "record_declaration":
+                    components = node.child_by_field_name("parameters")
+                    if components is not None:
+                        for component in components.children:
+                            if component.type == "formal_parameter":
+                                type_node = component.child_by_field_name("type")
+                            elif component.type == "spread_parameter":
+                                type_node = next(
+                                    (
+                                        child
+                                        for child in component.children
+                                        if child.is_named
+                                        and child.type not in ("modifiers", "variable_declarator")
+                                    ),
+                                    None,
+                                )
+                            else:
+                                continue
+                            refs: list[tuple[str, str]] = []
+                            _java_collect_type_refs(type_node, source, False, refs)
+                            component_line = component.start_point[0] + 1
+                            for ref_name, role in refs:
+                                ctx = "generic_arg" if role == "generic_arg" else "field"
+                                target_nid = ensure_named_node(ref_name, component_line)
+                                if target_nid != class_nid:
+                                    add_edge(class_nid, target_nid, "references",
+                                             component_line, context=ctx)
 
             # Scala: extends_clause carries `extends Base with Trait1 with Trait2`.
             # The first base after `extends` is `inherits`; each subsequent
@@ -5967,6 +6034,7 @@ def extract_julia(path: Path) -> dict:
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
+                "origin_file": str_path,
             })
         return nid
 
@@ -6263,6 +6331,7 @@ def extract_fortran(path: Path) -> dict:
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
+                "origin_file": str_path,
             })
         return nid
 
@@ -6512,6 +6581,7 @@ def extract_go(path: Path) -> dict:
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
+                "origin_file": str_path,
             })
         return nid
 
@@ -6866,6 +6936,7 @@ def extract_rust(path: Path) -> dict:
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
+                "origin_file": str_path,
             })
         return nid
 
@@ -7169,6 +7240,7 @@ def extract_powershell(path: Path) -> dict:
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
+                "origin_file": str_path,
             })
         return nid
 
@@ -7615,11 +7687,34 @@ def _disambiguate_colliding_node_ids(
         if len(group) < 2 or len(source_keys) < 2:
             continue
         ambiguous_ids.add(old_id)
+        # Salt the colliding id with the *path* it came from. The naive salt is
+        # ``_make_id(source_key, old_id)`` — source_key is the raw repo-relative
+        # path. But _make_id collapses every separator, so two DISTINCT paths
+        # whose only difference is a separator-vs-inner-punctuation swap
+        # (``a/b/c.md`` vs ``a.b/c.md``, ``foo/bar_baz.md`` vs ``foo_bar/baz.md``)
+        # normalize to the SAME salted id and still collide (#1522 — the residual
+        # of #1504 the 0.9.0 full-path stem didn't reach). When that happens,
+        # append a short stable hash of the *raw* source_key, which IS injective
+        # over distinct paths, so the colliders separate. Computed in code from
+        # source_file (never trusted from the LLM), so AST↔semantic parity holds.
+        naive: dict[str, str] = {}  # source_key -> _make_id(source_key, old_id)
+        for source_key in source_keys:
+            if source_key:
+                naive[source_key] = _make_id(source_key, old_id)
+        # source_keys that, after normalization, are not unique among themselves.
+        seen: dict[str, int] = {}
+        for nid in naive.values():
+            seen[nid] = seen.get(nid, 0) + 1
+        needs_hash = {sk for sk, nid in naive.items() if seen.get(nid, 0) > 1}
         for node in group:
             source_key = _node_disambiguation_source_key(node, root)
             if not source_key:
                 continue
-            new_id = _make_id(source_key, old_id)
+            if source_key in needs_hash:
+                salt = hashlib.sha1(source_key.encode("utf-8")).hexdigest()[:6]
+                new_id = _make_id(source_key, old_id, salt)
+            else:
+                new_id = naive.get(source_key) or _make_id(source_key, old_id)
             remap[(old_id, source_key)] = new_id
             if new_id != old_id:
                 node["id"] = new_id
@@ -9481,6 +9576,7 @@ def extract_objc(path: Path) -> dict:
                 "file_type": "code",
                 "source_file": "",
                 "source_location": "",
+                "origin_file": str_path,
             })
         return nid
 
@@ -13465,6 +13561,15 @@ def extract(
             item["source_file"] = sf_path.relative_to(root).as_posix()
         except ValueError:
             pass
+
+    # origin_file is an internal disambiguation hint (#1462): the colliding-id pass
+    # above reads it to keep same-named cross-file stubs distinct, after which nothing
+    # consumes it. Drop it from the returned nodes so it never ships into graph.json as
+    # an absolute, machine-specific path — the same "no absolute paths in output"
+    # contract that relativizes source_file just above (#555, #932). The per-file AST
+    # cache keeps its own copy, which is what the colliding-id pass reads on a cache hit.
+    for n in all_nodes:
+        n.pop("origin_file", None)
 
     # Tag AST provenance so the incremental watch rebuild can distinguish
     # AST-extracted nodes from semantic/LLM nodes. On a full re-extraction

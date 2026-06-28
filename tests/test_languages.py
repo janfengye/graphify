@@ -379,6 +379,34 @@ def test_java_generic_parents_include_type_argument_references(tmp_path):
     assert ("DerivedHandler", "Event") in refs
 
 
+def test_java_type_parameters_do_not_emit_references(tmp_path):
+    source = tmp_path / "TypeParameters.java"
+    source.write_text(
+        "class Payload {}\n"
+        "class Base<X> {}\n"
+        "class Box<T> extends Base<T> {\n"
+        "    T value;\n"
+        "    List<T> values;\n"
+        "    <U> U convert(T input, List<U> mapped, List<Payload> retained) {\n"
+        "        return null;\n"
+        "    }\n"
+        "    <V> Box(V value) {}\n"
+        "}\n"
+    )
+
+    result = extract_java(source)
+
+    references = _references(result)
+    assert not [edge for _, target, edge in references if target in {"T", "U", "V"}]
+    assert not [
+        node
+        for node in result["nodes"]
+        if node.get("label") in {"T", "U", "V"} and not node.get("source_file")
+    ]
+    assert ("Box", "Base") in _edge_labels(result, "inherits")
+    assert ("convert", "Payload") in _edge_labels(result, "references", "generic_arg")
+
+
 def test_java_parameter_return_generic_and_attribute_contexts():
     result = extract_java(FIXTURES / "sample.java")
     assert ("build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
@@ -404,6 +432,44 @@ def test_java_field_type_references_have_field_context(tmp_path):
     assert ("CheckoutService", "Handler") in _edge_labels(
         result, "references", "generic_arg"
     )
+
+
+def test_java_record_component_type_references(tmp_path):
+    source = tmp_path / "RecordComponents.java"
+    source.write_text(
+        "class Payload {}\n"
+        "class Item {}\n"
+        "class Attachment {}\n"
+        "record Order(Payload payload, List<Item> items, int count, "
+        "Attachment... attachments) {}\n"
+    )
+
+    result = extract_java(source)
+
+    assert ("Order", "Payload") in _edge_labels(result, "references", "field")
+    assert ("Order", "List") in _edge_labels(result, "references", "field")
+    assert ("Order", "Item") in _edge_labels(result, "references", "generic_arg")
+    assert ("Order", "Attachment") in _edge_labels(result, "references", "field")
+
+
+def test_java_record_components_skip_type_parameters(tmp_path):
+    source = tmp_path / "GenericRecord.java"
+    source.write_text(
+        "class Payload {}\n"
+        "class Box<X> {}\n"
+        "record Batch<T>(T value, Box<T> boxed, Box<Payload> retained) {}\n"
+    )
+
+    result = extract_java(source)
+
+    assert ("Batch", "T") not in _edge_labels(result, "references")
+    assert not [
+        node
+        for node in result["nodes"]
+        if node.get("label") == "T" and not node.get("source_file")
+    ]
+    assert ("Batch", "Box") in _edge_labels(result, "references", "field")
+    assert ("Batch", "Payload") in _edge_labels(result, "references", "generic_arg")
 
 
 def test_java_type_annotations_have_attribute_context(tmp_path):
