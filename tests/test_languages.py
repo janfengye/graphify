@@ -1214,6 +1214,136 @@ def test_objc_alloc_init_unknown_class_no_resolved_edge(tmp_path):
         assert e["target"] not in sourced_ids, f"unexpected resolved ref: {e}"
 
 
+def test_objc_dot_syntax_property_accesses_edge(tmp_path):
+    """self.name dot-syntax resolves to an accesses edge within the same class."""
+    p = tmp_path / "Dog.m"
+    p.write_text(
+        "@implementation Dog\n"
+        "- (NSString *)name { return @\"Rex\"; }\n"
+        "- (void)greet { NSLog(@\"%@\", self.name); }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    accesses = [(e["source"], e["target"]) for e in r["edges"]
+                if e["relation"] == "accesses"]
+    nid2label = {n["id"]: n["label"] for n in r["nodes"]}
+    assert len(accesses) == 1
+    assert nid2label[accesses[0][1]] == "-name"
+
+
+def test_objc_dot_syntax_no_fanout_two_same_named_properties(tmp_path):
+    """Two classes each declaring -name: self.name in A must NOT fan out to B's -name."""
+    p = tmp_path / "AB.m"
+    p.write_text(
+        "@implementation A\n"
+        "- (NSString *)name { return @\"A\"; }\n"
+        "- (void)show { NSLog(@\"%@\", self.name); }\n"
+        "@end\n"
+        "@implementation B\n"
+        "- (NSString *)name { return @\"B\"; }\n"
+        "- (void)show { NSLog(@\"%@\", self.name); }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    accesses = [e for e in r["edges"] if e["relation"] == "accesses"]
+    assert len(accesses) == 2, f"expected 2 scoped accesses, got {len(accesses)}: {accesses}"
+    nid2label = {n["id"]: n["label"] for n in r["nodes"]}
+    for e in accesses:
+        src_label = nid2label[e["source"]]
+        tgt_label = nid2label[e["target"]]
+        assert src_label == "-show" and tgt_label == "-name"
+
+
+def test_objc_dot_syntax_unresolvable_property_zero_edges(tmp_path):
+    """Accessing a property not defined in the current class produces zero accesses edges."""
+    p = tmp_path / "X.m"
+    p.write_text(
+        "@implementation X\n"
+        "- (void)run { NSLog(@\"%@\", self.missing); }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    accesses = [e for e in r["edges"] if e["relation"] == "accesses"]
+    assert len(accesses) == 0
+
+
+def test_objc_selector_expression_calls_edge(tmp_path):
+    """@selector(uniqueMethod) with exactly one match produces a calls edge."""
+    p = tmp_path / "Sched.m"
+    p.write_text(
+        "@implementation Sched\n"
+        "- (void)fetch { }\n"
+        "- (void)schedule { [self performSelector:@selector(fetch)]; }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    nid2label = {n["id"]: n["label"] for n in r["nodes"]}
+    sel_calls = [(nid2label.get(e["source"]), nid2label.get(e["target"]))
+                 for e in r["edges"]
+                 if e["relation"] == "calls" and e.get("context") == "call"]
+    assert ("-schedule", "-fetch") in sel_calls
+
+
+def test_objc_selector_no_fanout_two_same_named_methods(tmp_path):
+    """@selector(doThing) with two doThing methods must emit zero calls edges."""
+    p = tmp_path / "Dual.m"
+    p.write_text(
+        "@implementation A\n"
+        "- (void)doThing { }\n"
+        "- (void)run { [self performSelector:@selector(doThing)]; }\n"
+        "@end\n"
+        "@implementation B\n"
+        "- (void)doThing { }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    nid2label = {n["id"]: n["label"] for n in r["nodes"]}
+    sel_edges = [e for e in r["edges"]
+                 if e["relation"] == "calls"
+                 and nid2label.get(e["target"], "").endswith("doThing")]
+    assert len(sel_edges) == 0, f"expected 0 selector edges with ambiguous name, got {sel_edges}"
+
+
+def test_objc_dot_syntax_substring_sibling_exact_match(tmp_path):
+    """A substring-colliding sibling must neither be falsely matched nor suppress
+    the real match: `self.name` with both `-name` and `-surname` present resolves
+    to `-name` ONLY (exact id, not a `endswith` suffix) (#1475)."""
+    p = tmp_path / "Person.m"
+    p.write_text(
+        "@implementation Person\n"
+        "- (NSString *)name { return @\"n\"; }\n"
+        "- (NSString *)surname { return @\"s\"; }\n"
+        "- (void)show { NSLog(@\"%@\", self.name); }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    nid2label = {n["id"]: n["label"] for n in r["nodes"]}
+    accesses = [(nid2label.get(e["source"]), nid2label.get(e["target"]))
+                for e in r["edges"] if e["relation"] == "accesses"]
+    assert ("-show", "-name") in accesses, f"self.name must resolve to -name: {accesses}"
+    assert ("-show", "-surname") not in accesses, f"self.name must NOT match -surname: {accesses}"
+
+
+def test_objc_selector_substring_method_exact_match(tmp_path):
+    """@selector(doThing) must resolve to `-doThing` exactly, not be suppressed by
+    a substring-colliding `-reallyDoThing` (exact match, not suffix) (#1475)."""
+    p = tmp_path / "Worker.m"
+    p.write_text(
+        "@implementation Worker\n"
+        "- (void)doThing { }\n"
+        "- (void)reallyDoThing { }\n"
+        "- (void)run { [self performSelector:@selector(doThing)]; }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    nid2label = {n["id"]: n["label"] for n in r["nodes"]}
+    sel_calls = [(nid2label.get(e["source"]), nid2label.get(e["target"]))
+                 for e in r["edges"]
+                 if e["relation"] == "calls" and e.get("context") == "call"]
+    assert ("-run", "-doThing") in sel_calls, f"@selector(doThing) must resolve to -doThing: {sel_calls}"
+    assert ("-run", "-reallyDoThing") not in sel_calls
+
+
 # ---------------------------------------------------------------------------
 # Go
 # ---------------------------------------------------------------------------
@@ -1715,6 +1845,154 @@ def test_ts_local_const_does_not_emit_phantom_node(tmp_path):
 
     assert "inner" not in labels, f"phantom TS node for arrow-body local 'inner': {labels}"
     assert "topLevel" in labels, f"module-level TS const 'topLevel' missing: {labels}"
+
+
+def test_ts_constructor_injection_calls_edge(tmp_path):
+    """this.repo.findById() in a class with constructor(private repo: IUserRepository)
+    must produce a calls edge from getUser() to findById() (#1316)."""
+    from graphify.extract import extract
+    repo_ts = tmp_path / "repo.ts"
+    repo_ts.write_text(
+        "export interface IUserRepository {\n"
+        "  findById(id: string): Promise<any>;\n"
+        "  save(user: any): Promise<void>;\n"
+        "}\n"
+    )
+    svc_ts = tmp_path / "service.ts"
+    svc_ts.write_text(
+        "import { IUserRepository } from './repo';\n"
+        "\n"
+        "export class UserService {\n"
+        "  constructor(private repo: IUserRepository) {}\n"
+        "\n"
+        "  getUser(id: string) {\n"
+        "    return this.repo.findById(id);\n"
+        "  }\n"
+        "}\n"
+    )
+    r = extract([repo_ts, svc_ts], cache_root=tmp_path / "cache")
+    edge_triples = {
+        (e["source"], e["relation"], e["target"])
+        for e in r["edges"]
+    }
+    labels_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    label_triples = {
+        (labels_by_id.get(s, s), rel, labels_by_id.get(t, t))
+        for s, rel, t in edge_triples
+    }
+    calls_from_get_user = [
+        (s, rel, t) for s, rel, t in label_triples
+        if "getUser" in s and rel == "calls"
+    ]
+    assert any("findById" in t for _, _, t in calls_from_get_user), (
+        f"expected getUser()->findById() calls edge, got: {calls_from_get_user}"
+    )
+
+
+def test_ts_this_field_receiver_not_same_file_collision(tmp_path):
+    """this.db.query() should NOT match an unrelated query() in the same file (#1316)."""
+    f = tmp_path / "collision.ts"
+    f.write_text(
+        "function query() { return 'global'; }\n"
+        "\n"
+        "export class Service {\n"
+        "  constructor(private db: Database) {}\n"
+        "\n"
+        "  run() {\n"
+        "    return this.db.query();\n"
+        "  }\n"
+        "}\n"
+    )
+    r = extract_js(f)
+    calls_edges = [
+        e for e in r["edges"]
+        if e["relation"] == "calls"
+    ]
+    caller_labels = {n["id"]: n["label"] for n in r["nodes"]}
+    run_to_query = [
+        e for e in calls_edges
+        if "run" in caller_labels.get(e["source"], "")
+        and "query" in caller_labels.get(e["target"], "")
+    ]
+    assert len(run_to_query) == 0, (
+        f"this.db.query() should NOT resolve to bare query() in same file: {run_to_query}"
+    )
+
+
+def _ts_label_calls(r, src_sub):
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    return [
+        labels.get(e["target"], e["target"])
+        for e in r["edges"]
+        if e["relation"] == "calls" and src_sub in labels.get(e["source"], e["source"])
+    ]
+
+
+def test_ts_injected_field_resolves_to_typed_class_not_same_named_collision(tmp_path):
+    """The decisive #1316 guardrail: two classes each define `query`, but the
+    injected field is typed `Database`, so `this.db.query()` must resolve to
+    Database.query ONLY — never HttpClient.query (no global name-match fan-out)."""
+    from graphify.extract import extract
+    (tmp_path / "database.ts").write_text(
+        "export class Database {\n  query(sql: string) { return sql; }\n}\n"
+    )
+    (tmp_path / "http.ts").write_text(
+        "export class HttpClient {\n  query(url: string) { return url; }\n}\n"
+    )
+    (tmp_path / "service.ts").write_text(
+        "import { Database } from './database';\n"
+        "export class Service {\n"
+        "  constructor(private db: Database) {}\n"
+        "  run() { return this.db.query('x'); }\n"
+        "}\n"
+    )
+    r = extract(
+        [tmp_path / "database.ts", tmp_path / "http.ts", tmp_path / "service.ts"],
+        cache_root=tmp_path / "cache",
+    )
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    # Find the run()->query calls edge and confirm its target is owned by Database.
+    method_owner = {
+        e["target"]: e["source"]
+        for e in r["edges"] if e["relation"] == "method"
+    }
+    run_query_targets = [
+        e["target"] for e in r["edges"]
+        if e["relation"] == "calls"
+        and "run" in labels.get(e["source"], "")
+        and "query" in labels.get(e["target"], "")
+    ]
+    assert run_query_targets, "expected this.db.query() to resolve to a query method"
+    for tgt in run_query_targets:
+        owner = method_owner.get(tgt)
+        assert owner is not None and labels.get(owner) == "Database", (
+            f"this.db.query() must resolve to Database.query, got owner {labels.get(owner)}"
+        )
+
+
+def test_ts_injected_field_ambiguous_type_emits_no_edge(tmp_path):
+    """If the injected field's type name is ambiguous (two classes named Database),
+    the god-node guard bails — no calls edge rather than a guess (#1316)."""
+    from graphify.extract import extract
+    (tmp_path / "a" ).mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "database.ts").write_text(
+        "export class Database {\n  query(sql: string) { return sql; }\n}\n"
+    )
+    (tmp_path / "b" / "database.ts").write_text(
+        "export class Database {\n  query(sql: string) { return sql; }\n}\n"
+    )
+    (tmp_path / "service.ts").write_text(
+        "export class Service {\n"
+        "  constructor(private db: Database) {}\n"
+        "  run() { return this.db.query('x'); }\n"
+        "}\n"
+    )
+    r = extract(sorted(tmp_path.rglob("*.ts")), cache_root=tmp_path / "cache")
+    # `query` resolution must bail (2 Database defs) -> no run()->query calls edge.
+    assert not [t for t in _ts_label_calls(r, "run") if "query" in t], (
+        "ambiguous Database type must not produce a this.db.query() edge"
+    )
 
 
 # ── Markdown ─────────────────────────────────────────────────────────────────
