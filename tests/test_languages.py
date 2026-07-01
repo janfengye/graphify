@@ -975,6 +975,23 @@ def test_elixir_import_edges_have_import_context():
     assert import_edges
     assert all(e.get("context") == "import" for e in import_edges)
 
+
+def test_elixir_multi_alias_expands():
+    """`alias Foo.{Bar, Baz}` must emit one imports edge per expanded module.
+
+    The brace form is a `dot` node with a trailing `tuple`; the single-alias
+    handler only matched a bare `alias` child, so every multi-alias import was
+    silently dropped.
+    """
+    r = extract_elixir(FIXTURES / "sample.ex")
+    import_segs = [
+        e["target"].rsplit("_", 1)[-1]
+        for e in r["edges"] if e["relation"] == "imports"
+    ]
+    # from `alias MyApp.Schemas.{Account, Token}`
+    assert "account" in import_segs, "MyApp.Schemas.Account import missing"
+    assert "token" in import_segs, "MyApp.Schemas.Token import missing"
+
 def test_elixir_finds_calls():
     r = extract_elixir(FIXTURES / "sample.ex")
     calls = {(e["source"], e["target"]) for e in r["edges"] if e["relation"] == "calls"}
@@ -1429,6 +1446,20 @@ def test_julia_import_edges_have_import_context():
     assert all(e.get("context") == "import" for e in import_edges)
 
 
+def test_julia_qualified_and_relative_imports():
+    """Qualified (`using Base.Threads`) and relative (`using ..Mod`) imports
+    must emit edges.
+
+    The handler only matched bare identifiers, so scoped_identifier and
+    import_path forms — and the scoped package of a selected_import — were
+    silently dropped.
+    """
+    r = extract_julia(FIXTURES / "sample.jl")
+    targets = [e["target"] for e in r["edges"] if e["relation"] == "imports"]
+    assert any("base_threads" in t for t in targets), "qualified import Base.Threads missing"
+    assert any("parentmodule" in t for t in targets), "relative import ParentModule missing"
+
+
 def test_julia_finds_inherits():
     r = extract_julia(FIXTURES / "sample.jl")
     inherits = [e for e in r["edges"] if e["relation"] == "inherits"]
@@ -1512,6 +1543,24 @@ def test_fortran_finds_calls():
     r = extract_fortran(FIXTURES / "sample.f90")
     call_edges = [e for e in r["edges"] if e["relation"] == "calls"]
     assert len(call_edges) >= 1
+
+
+def test_fortran_finds_function_call():
+    """`y = f(x)` function invocations must emit a calls edge.
+
+    Function calls are `call_expression` (not `subroutine_call`); that node was
+    never handled, so every function-to-function call was dropped. The callee is
+    resolved against defined procedures so array indexing (`arr(i)`) can't
+    fabricate a spurious edge.
+    """
+    r = extract_fortran(FIXTURES / "sample.f90")
+    labels = {n["id"]: n["label"] for n in r["nodes"]}
+    found = any(
+        "report" in labels.get(e["source"], "")
+        and "double_val" in labels.get(e["target"], "")
+        for e in r["edges"] if e["relation"] == "calls"
+    )
+    assert found, "report() should have a calls edge to double_val()"
 
 
 def test_fortran_case_insensitive_names():
@@ -2600,6 +2649,18 @@ def test_systemverilog_field_parameter_return_and_generic_contexts():
     assert ("build", "Payload") in _edge_labels(r, "references", "parameter_type")
     assert ("build", "Result") in _edge_labels(r, "references", "return_type")
     assert ("build", "Payload") in _edge_labels(r, "references", "generic_arg")
+
+
+def test_systemverilog_qualified_field_references():
+    """Class properties with leading qualifiers (rand/local/protected/etc.) must
+    still emit `references` field edges. The field regex only matched unqualified
+    `<type> <name>;` declarations, so `rand Config x;` (three tokens) failed to
+    match and its type reference was silently dropped.
+    """
+    r = extract_verilog(FIXTURES / "sample.sv")
+    field_refs = _edge_labels(r, "references", "field")
+    assert ("DataProcessor", "Config") in field_refs, "rand-qualified field dropped"
+    assert ("DataProcessor", "BaseProcessor") in field_refs, "protected-qualified field dropped"
 
 
 def test_systemverilog_does_not_emit_type_parameter_refs():
