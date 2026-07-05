@@ -1932,8 +1932,13 @@ def _dynamic_import_js(node, source: bytes, caller_nid: str, str_path: str, edge
             edges.append({
                 "source": caller_nid,
                 "target": tgt_nid,
+                # A deferred `import(...)` is a real dependency, so keep it as an
+                # `imports_from` edge (visible in the graph) but mark it `deferred`
+                # so find_import_cycles does not treat it as a static import and
+                # report a phantom file cycle (#1241).
                 "relation": "imports_from",
                 "context": "import",
+                "deferred": True,
                 "confidence": "EXTRACTED",
                 "source_file": str_path,
                 "source_location": f"L{node.start_point[0] + 1}",
@@ -3445,6 +3450,10 @@ def _extract_generic(
     # `let vm = VM()`) live outside function bodies, so the call-walk never
     # reaches them. Collect (owner_nid, call_node) here and walk them too.
     initializer_nodes: list[tuple[str, object]] = []
+    # Ruby include/extend/prepend mixins collected during the node walk (#1668),
+    # merged into raw_calls after the call-walk populates it (raw_calls does not
+    # exist yet while walk() runs). Resolved cross-file by the Ruby resolver.
+    _ruby_mixin_calls: list[dict] = []
     # #1356: per-file map of local name -> declared type (properties + params),
     # threaded out as `swift_type_table` so member calls (`vm.update()`) can be
     # resolved to the receiver's real definition in _resolve_swift_member_calls.
@@ -3813,6 +3822,36 @@ def _extract_generic(
                                 })
                                 seen_ids.add(base_nid)
                         add_edge(class_nid, base_nid, "inherits", line)
+
+                # `include`/`extend`/`prepend <Const>` in the class/module body ->
+                # a `mixes_in` edge to the module (#1668). The module usually lives
+                # in another file, so defer resolution to the cross-file Ruby
+                # resolver (reusing the #1634 candidate logic and the #1640 module
+                # nodes as targets). Only bare/namespaced constant arguments count;
+                # `extend self`, `include some_var`, etc. are skipped.
+                _rb_body = _find_body(node, config)
+                if _rb_body is not None:
+                    for _stmt in _rb_body.children:
+                        if _stmt.type != "call" or _stmt.child_by_field_name("receiver") is not None:
+                            continue
+                        _m = _stmt.child_by_field_name("method")
+                        if _m is None or _read_text(_m, source) not in ("include", "extend", "prepend"):
+                            continue
+                        _args = _stmt.child_by_field_name("arguments")
+                        if _args is None:
+                            continue
+                        for _arg in _args.children:
+                            if _arg.type not in ("constant", "scope_resolution"):
+                                continue
+                            _mod = _ruby_const_last_name(_arg, source)
+                            if _mod:
+                                _ruby_mixin_calls.append({
+                                    "caller_nid": class_nid,
+                                    "callee": _mod,
+                                    "is_mixin": True,
+                                    "source_file": str_path,
+                                    "source_location": f"L{_stmt.start_point[0] + 1}",
+                                })
 
             # C#-specific: inheritance / interface implementation via base_list
             if config.ts_module == "tree_sitter_c_sharp":
@@ -5571,6 +5610,10 @@ def _extract_generic(
         if src in valid_ids and (tgt in valid_ids or edge["relation"] in ("imports", "imports_from", "re_exports")):
             clean_edges.append(edge)
 
+    # Ruby mixins were collected during the node walk (before raw_calls existed);
+    # fold them in so the cross-file resolver sees them (#1668).
+    if _ruby_mixin_calls:
+        raw_calls.extend(_ruby_mixin_calls)
     result = {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls}
     if callable_def_nids:
         # Mark function / method / class defs with a `_callable` attribute so the
@@ -15839,7 +15882,7 @@ def _is_cpp_header(path: Path) -> bool:
 
 def _get_extractor(path: Path) -> Any | None:
     """Return the correct extractor function for a file, or None if unsupported."""
-    if path.name.endswith(".blade.php"):
+    if path.name.lower().endswith(".blade.php"):
         return extract_blade
     # MCP config files (.mcp.json, claude_desktop_config.json, ...) are routed
     # by filename before generic .json dispatch so they get MCP-aware nodes
@@ -15855,14 +15898,17 @@ def _get_extractor(path: Path) -> Any | None:
     # (the suffix map sends `.h` to extract_c, which can't read @interface etc.).
     # ObjC sniffing has priority over the C++ sniff: an Objective-C++ header can
     # contain both `@interface` and inline C++ (`::`), and it must parse as ObjC.
-    if path.suffix == ".h":
+    suffix = path.suffix
+    if suffix not in _DISPATCH and suffix.lower() in _DISPATCH:
+        suffix = suffix.lower()
+    if suffix == ".h":
         if _is_objc_header(path):
             return extract_objc
         # A C++ class header routed to extract_c loses the class entirely (the C
         # grammar has no class_specifier). Reroute to extract_cpp (#1547).
         if _is_cpp_header(path):
             return extract_cpp
-    return _DISPATCH.get(path.suffix)
+    return _DISPATCH.get(suffix)
 
 
 def _safe_extract_with_xaml_root(extractor, path: Path, root: Path) -> dict:
@@ -15904,7 +15950,12 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
         return idx, {"nodes": [], "edges": []}
 
     result = _safe_extract_with_xaml_root(extractor, path, cache_root)
-    if not bypass_cache and "error" not in result:
+    # Never cache a zero-node result for an extractable file. Every supported
+    # source produces at least a file node, so an empty node list is anomalous
+    # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
+    # byte-stable across runs and silently blinds affected/explain to and
+    # through the file (#1666); skipping the write lets a rerun self-heal.
+    if not bypass_cache and "error" not in result and result.get("nodes"):
         save_cached(path, result, cache_root)
     return idx, result
 
@@ -16028,7 +16079,8 @@ def _extract_sequential(
             continue
         bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
         result = _safe_extract_with_xaml_root(extractor, path, effective_root)
-        if not bypass_cache and "error" not in result:
+        # See _extract_single_file: don't cache an anomalous zero-node result (#1666).
+        if not bypass_cache and "error" not in result and result.get("nodes"):
             save_cached(path, result, effective_root)
         per_file[idx] = result
     if total_files >= _PROGRESS_INTERVAL:
@@ -16123,6 +16175,27 @@ def extract(
     for i in range(total):
         if per_file[i] is None:
             per_file[i] = {"nodes": [], "edges": []}
+
+    # #1666: surface any source file an extractor accepted but that produced zero
+    # nodes (not even a file node). Such a file is silently absent from the graph,
+    # so affected/explain are blind to and through it with no other signal.
+    _empty_sources: list[str] = []
+    for i, _p in enumerate(paths):
+        _res = per_file[i] or {}
+        if _res.get("nodes") or _res.get("error"):
+            continue
+        if _get_extractor(_p) is not None:
+            _empty_sources.append(str(_p))
+    if _empty_sources:
+        _shown = ", ".join(Path(x).name for x in _empty_sources[:5])
+        _more = f" (+{len(_empty_sources) - 5} more)" if len(_empty_sources) > 5 else ""
+        print(
+            f"  warning: {len(_empty_sources)} source file(s) produced zero nodes and "
+            f"are absent from the graph: {_shown}{_more}. A re-run will retry them "
+            f"(empties are no longer cached); if it persists, please report the "
+            f"file(s) (#1666).",
+            file=sys.stderr, flush=True,
+        )
 
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
@@ -16403,6 +16476,12 @@ def extract(
         # and collides with any top-level function named "log" in the corpus.
         if rc.get("is_member_call"):
             continue
+        # Skip Ruby include/extend/prepend mixin markers: they carry a module
+        # name as `callee` but are not calls — the Ruby resolver turns them into
+        # `mixes_in` edges. Letting the shared pass emit a `calls` edge here would
+        # both mislabel the relation and block the mixes_in emit as a dup (#1668).
+        if rc.get("is_mixin"):
+            continue
         # Exact-case match first (case is semantic). Fold only when the CALLING
         # file's language is case-insensitive, and only against the folded index of
         # case-insensitive-language definitions — so a Python `Path()` call can never
@@ -16614,7 +16693,8 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
             ]
             for fname in filenames:
                 p = dp / fname
-                if p.suffix in _EXTENSIONS and not _ignored(p) and _resolves_under_root(p, containment_root):
+                suffix = p.suffix
+                if (suffix in _EXTENSIONS or suffix.lower() in _EXTENSIONS) and not _ignored(p) and _resolves_under_root(p, containment_root):
                     results.append(p)
         return sorted(results)
     # Walk with symlink following + cycle detection
@@ -16634,7 +16714,8 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
         ]
         for fname in filenames:
             p = dp / fname
-            if p.suffix in _EXTENSIONS and not _ignored(p) and _resolves_under_root(p, containment_root):
+            suffix = p.suffix
+            if (suffix in _EXTENSIONS or suffix.lower() in _EXTENSIONS) and not _ignored(p) and _resolves_under_root(p, containment_root):
                 results.append(p)
     return sorted(results)
 
