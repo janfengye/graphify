@@ -868,6 +868,69 @@ def _java_type_parameters_in_scope(node, source: bytes) -> frozenset[str]:
     return frozenset(names)
 
 
+# java.lang (auto-imported) plus the ubiquitous java.util / java.io / java.time /
+# java.util.{stream,function,concurrent} / java.math / java.nio.file types that
+# appear as field, parameter, return, and generic-argument annotations. They never
+# resolve to a project node, so emitting `references` edges to them is pure noise
+# (mirrors _GO_PREDECLARED_TYPES / _PYTHON_ANNOTATION_NOISE). Suppressed at the
+# type-ref walker so they are never created as nodes or emitted as edges. The
+# boxed-scalar/`void` primitives are already dropped by grammar node type above;
+# these are the class/interface names the grammar reports as identifiers.
+_JAVA_BUILTIN_TYPES = frozenset({
+    # java.lang — core
+    "Object", "String", "CharSequence", "StringBuilder", "StringBuffer",
+    "Number", "Byte", "Short", "Integer", "Long", "Float", "Double",
+    "Boolean", "Character", "Void", "Class", "Enum", "Record", "Math",
+    "System", "Thread", "Runnable", "Comparable", "Iterable", "Cloneable",
+    "AutoCloseable", "Appendable", "Readable", "Process", "ProcessBuilder",
+    "Runtime", "Package", "ThreadLocal", "InheritableThreadLocal",
+    # java.lang — throwables
+    "Throwable", "Exception", "RuntimeException", "Error",
+    "IllegalArgumentException", "IllegalStateException", "NullPointerException",
+    "IndexOutOfBoundsException", "ArrayIndexOutOfBoundsException",
+    "ClassCastException", "NumberFormatException", "ArithmeticException",
+    "UnsupportedOperationException", "InterruptedException",
+    "CloneNotSupportedException", "SecurityException", "StackOverflowError",
+    "OutOfMemoryError", "AssertionError",
+    # java.util — collections & core
+    "Collection", "List", "ArrayList", "LinkedList", "Vector", "Stack",
+    "Set", "HashSet", "LinkedHashSet", "TreeSet", "SortedSet", "NavigableSet",
+    "EnumSet", "Map", "HashMap", "LinkedHashMap", "TreeMap", "SortedMap",
+    "NavigableMap", "Hashtable", "EnumMap", "Properties", "Queue", "Deque",
+    "ArrayDeque", "PriorityQueue", "Iterator", "ListIterator", "Comparator",
+    "Optional", "OptionalInt", "OptionalLong", "OptionalDouble", "Collections",
+    "Arrays", "Objects", "Date", "Calendar", "Random", "UUID", "Scanner",
+    "StringJoiner", "StringTokenizer", "BitSet", "Spliterator", "Locale",
+    "NoSuchElementException", "ConcurrentModificationException",
+    # java.util.stream
+    "Stream", "IntStream", "LongStream", "DoubleStream", "Collector",
+    "Collectors",
+    # java.util.function
+    "Function", "BiFunction", "Consumer", "BiConsumer", "Supplier",
+    "Predicate", "BiPredicate", "UnaryOperator", "BinaryOperator",
+    "IntFunction", "ToIntFunction", "ToLongFunction", "ToDoubleFunction",
+    # java.util.concurrent
+    "Callable", "Future", "CompletableFuture", "CompletionStage", "Executor",
+    "ExecutorService", "Executors", "ScheduledExecutorService", "TimeUnit",
+    "ConcurrentHashMap", "ConcurrentMap", "CopyOnWriteArrayList",
+    "BlockingQueue", "CountDownLatch", "Semaphore", "CyclicBarrier",
+    "AtomicInteger", "AtomicLong", "AtomicBoolean", "AtomicReference",
+    # java.time
+    "Instant", "Duration", "Period", "LocalDate", "LocalTime", "LocalDateTime",
+    "ZonedDateTime", "OffsetDateTime", "ZoneId", "ZoneOffset", "DayOfWeek",
+    "Month", "Year", "Clock", "DateTimeFormatter",
+    # java.io / java.nio.file
+    "IOException", "UncheckedIOException", "FileNotFoundException", "File",
+    "InputStream", "OutputStream", "Reader", "Writer", "BufferedReader",
+    "BufferedWriter", "InputStreamReader", "OutputStreamWriter", "FileReader",
+    "FileWriter", "PrintStream", "PrintWriter", "ByteArrayInputStream",
+    "ByteArrayOutputStream", "Serializable", "Closeable", "Path", "Paths",
+    "Files",
+    # java.math
+    "BigDecimal", "BigInteger",
+})
+
+
 def _java_collect_type_refs(
     node,
     source: bytes,
@@ -885,19 +948,23 @@ def _java_collect_type_refs(
         return
     if t == "type_identifier":
         name = _read_text(node, source)
-        if name and name not in skip:
+        if name and name not in skip and name not in _JAVA_BUILTIN_TYPES:
             out.append((name, "generic_arg" if generic else "type"))
         return
     if t == "scoped_type_identifier":
         text = _read_text(node, source).rsplit(".", 1)[-1]
-        if text:
+        if text and text not in _JAVA_BUILTIN_TYPES:
             out.append((text, "generic_arg" if generic else "type"))
         return
     if t == "generic_type":
         for c in node.children:
             if c.type in ("type_identifier", "scoped_type_identifier"):
                 text = _read_text(c, source).rsplit(".", 1)[-1]
-                if text and (c.type == "scoped_type_identifier" or text not in skip):
+                if (
+                    text
+                    and text not in _JAVA_BUILTIN_TYPES
+                    and (c.type == "scoped_type_identifier" or text not in skip)
+                ):
                     out.append((text, "generic_arg" if generic else "type"))
                 break
         for c in node.children:
@@ -5799,7 +5866,114 @@ def extract_js(path: Path) -> dict:
         config = _TS_CONFIG
     else:
         config = _JS_CONFIG
-    return _extract_generic(path, config)
+    result = _extract_generic(path, config)
+    if "error" not in result:
+        _extract_js_rationale(path, result)
+    return result
+
+
+# ── JS/TS rationale + doc-reference extraction ────────────────────────────────
+#
+# Parity with _extract_python_rationale: Python files get rationale nodes from
+# docstrings and `# NOTE:`-style comments, but JS/TS comments were discarded
+# entirely. That silently drops two high-value signals in mixed corpora:
+#   1. rationale comments (`// NOTE:`, `// WHY:`, ...) — same as Python;
+#   2. architecture-decision references (`ADR-0011`, `RFC 793`) that teams
+#      conventionally cite in file/function headers. These are the natural
+#      join points between code and design docs in the same graph — without
+#      them, code<->ADR edges never form even when the code cites the ADR.
+
+_JS_RATIONALE_PREFIXES = (
+    "// NOTE:", "// IMPORTANT:", "// HACK:", "// WHY:", "// RATIONALE:",
+    "// TODO:", "// FIXME:",
+    "* NOTE:", "* IMPORTANT:", "* HACK:", "* WHY:", "* RATIONALE:",
+    "* TODO:", "* FIXME:",
+)
+
+# Doc-reference tokens worth first-classing as graph nodes. Deliberately
+# conservative: ADR-NNNN (Architecture Decision Records, any zero padding)
+# and RFC NNNN / RFC-NNNN.
+_JS_DOC_REF_RE = re.compile(r"\b(ADR[- ]?\d{1,5}|RFC[- ]?\d{1,5})\b", re.IGNORECASE)
+
+# Only look for doc references inside comments, not string literals or code.
+_JS_COMMENT_LINE_RE = re.compile(r"^\s*(//|/\*|\*)")
+
+
+def _extract_js_rationale(path: Path, result: dict) -> None:
+    """Post-pass: extract rationale comments and doc references from JS/TS source.
+    Mutates result in-place by appending to result['nodes'] and result['edges'].
+    """
+    try:
+        source_text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes = result["nodes"]
+    edges = result["edges"]
+    seen_ids = {n["id"] for n in nodes}
+    file_nid = _make_id(str(path))
+    seen_doc_refs: set[str] = set()
+
+    def _add_rationale(text: str, line: int) -> None:
+        label = text[:80].replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
+        rid = _make_id(stem, "rationale", str(line))
+        if rid not in seen_ids:
+            seen_ids.add(rid)
+            nodes.append({
+                "id": rid,
+                "label": label,
+                "file_type": "rationale",
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+        edges.append({
+            "source": rid,
+            "target": file_nid,
+            "relation": "rationale_for",
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        })
+
+    def _add_doc_ref(token: str, line: int) -> None:
+        # Normalize "adr 11" / "ADR-0011" spellings to a canonical "ADR-0011"
+        # style label so references to the same document collapse to one node.
+        kind, num = re.match(r"([A-Za-z]+)[- ]?(\d+)", token).groups()
+        kind = kind.upper()
+        label = f"{kind}-{num.zfill(4)}" if kind == "ADR" else f"{kind}-{num}"
+        if label in seen_doc_refs:
+            return
+        seen_doc_refs.add(label)
+        rid = _make_id("docref", label)
+        if rid not in seen_ids:
+            seen_ids.add(rid)
+            nodes.append({
+                "id": rid,
+                "label": label,
+                "file_type": "doc_ref",
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+        edges.append({
+            "source": file_nid,
+            "target": rid,
+            "relation": "cites",
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        })
+
+    for lineno, line_text in enumerate(source_text.splitlines(), start=1):
+        stripped = line_text.strip()
+        if any(stripped.startswith(p) for p in _JS_RATIONALE_PREFIXES):
+            _add_rationale(stripped.lstrip("/* "), lineno)
+        if _JS_COMMENT_LINE_RE.match(line_text):
+            for m in _JS_DOC_REF_RE.finditer(stripped):
+                _add_doc_ref(m.group(1), lineno)
 
 
 def extract_svelte(path: Path) -> dict:
@@ -15821,6 +15995,30 @@ _DISPATCH: dict[str, Any] = {
 }
 
 
+# Extensionless executables (CLI entry points like `devctl` or `manage`) carry
+# their language in the shebang, not the suffix. detect.classify_file already
+# routes them to the CODE path via _shebang_interpreter; _get_extractor must
+# honor the same signal or these files are classified as code and then silently
+# dropped by extraction. Only interpreters with a real extractor are mapped —
+# detect's wider set (perl, fish, tcsh, Rscript) stays unmapped and skipped.
+_SHEBANG_DISPATCH: dict[str, Any] = {
+    "python": extract_python,
+    "python2": extract_python,
+    "python3": extract_python,
+    "bash": extract_bash,
+    "sh": extract_bash,
+    "dash": extract_bash,
+    "zsh": extract_bash,
+    "ksh": extract_bash,
+    "node": extract_js,
+    "nodejs": extract_js,
+    "ruby": extract_ruby,
+    "lua": extract_lua,
+    "php": extract_php,
+    "julia": extract_julia,
+}
+
+
 # ObjC-only directives. They are illegal in C and C++, so finding one in a `.h`
 # file is a near-zero-false-positive signal that the header is Objective-C (and so
 # belongs to extract_objc, not extract_c). `@property` is deliberately excluded: it
@@ -15908,6 +16106,14 @@ def _get_extractor(path: Path) -> Any | None:
         # grammar has no class_specifier). Reroute to extract_cpp (#1547).
         if _is_cpp_header(path):
             return extract_cpp
+    # Extensionless files: resolve by shebang, mirroring detect.classify_file.
+    # Without this, detect labels e.g. `#!/usr/bin/env bash` CLIs as code but
+    # extraction returns no extractor and the file silently contributes nothing.
+    if not suffix:
+        from graphify.detect import _shebang_interpreter
+        interp = _shebang_interpreter(path)
+        if interp is not None:
+            return _SHEBANG_DISPATCH.get(interp)
     return _DISPATCH.get(suffix)
 
 
