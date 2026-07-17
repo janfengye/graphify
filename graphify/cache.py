@@ -465,7 +465,8 @@ def cache_dir(root: Path = Path("."), kind: str = "ast",
 def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
                 cache_root: Path | None = None, prompt: "str | Path | None" = None,
                 prompt_file: "str | Path | None" = None,
-                allow_legacy: bool = True) -> dict | None:
+                allow_legacy: bool = True,
+                allow_partial: bool = False) -> dict | None:
     """Return cached extraction for this file if hash matches, else None.
 
     Cache key: SHA256 of file contents.
@@ -513,6 +514,17 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast",
         try:
             result = json.loads(entry.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
+            return None
+        # A ``partial`` entry was produced from a truncated LLM response and
+        # covers only part of the file's symbols. Serving it as authoritative
+        # would return the incomplete node set forever until the file is
+        # re-extracted. Treat it as a cache MISS (the normal read path) so the
+        # file is re-dispatched and retried. Self-heals: a later complete
+        # extraction overwrites the same content-hash key with a non-partial
+        # entry. ``allow_partial`` is the one exception — the merge_existing
+        # checkpoint peeks at a partial prev so it can accumulate a file's slices
+        # across chunks without losing the truncated one (it stays partial).
+        if not allow_partial and isinstance(result, dict) and result.get("partial"):
             return None
         if legacy_hit:
             _legacy_semantic_hits += 1
@@ -748,6 +760,23 @@ def check_semantic_cache(
     return cached_nodes, cached_edges, cached_hyperedges, uncached
 
 
+def _group_has_partial_marker(group: dict) -> bool:
+    """True if any node/edge/hyperedge in a per-file group carries the internal
+    ``_partial`` truncation marker set by the adaptive-retry give-up sites.
+
+    The marker rides the item dicts up through every chunk merge, so it reaches
+    ``save_semantic_cache`` on BOTH the incremental checkpoint path (llm.py) and
+    the final authoritative save (cli.py) without either caller having to thread
+    an extra argument — the final save would otherwise overwrite a checkpoint's
+    ``partial`` flag with a clean-looking entry.
+    """
+    for bucket in ("nodes", "edges", "hyperedges"):
+        for item in group.get(bucket, []):
+            if isinstance(item, dict) and item.get("_partial"):
+                return True
+    return False
+
+
 def save_semantic_cache(
     nodes: list[dict],
     edges: list[dict],
@@ -758,6 +787,7 @@ def save_semantic_cache(
     mode: str | None = None,
     prompt: "str | Path | None" = None,
     prompt_file: "str | Path | None" = None,
+    partial_source_files: Iterable[str | Path] | None = None,
 ) -> int:
     """Save semantic extraction results to cache, keyed by source_file.
 
@@ -781,6 +811,13 @@ def save_semantic_cache(
     cache-write keys. Semantic nodes can legitimately mention another corpus
     file, but a model must not be able to replace that file's complete cache
     entry unless the file was part of the current extraction batch (#1757).
+
+    When ``partial_source_files`` is provided, entries for those files are
+    stamped ``partial: True`` — the extraction was truncated, so the entry is
+    incomplete and :func:`load_cached` must treat it as a miss. Partial-ness is
+    ALSO detected intrinsically from a ``_partial`` marker on any grouped item,
+    so the flag survives even when a caller (e.g. cli.py's final save) does not
+    pass ``partial_source_files``.
 
     ``prompt`` is the extraction prompt that produced these results — text, or
     a Path to the prompt file. It stamps entries into the p{fingerprint}/
@@ -823,6 +860,20 @@ def save_semantic_cache(
     allowed_paths = None
     if allowed_source_files is not None:
         allowed_paths = {resolved_source_path(path) for path in allowed_source_files}
+
+    partial_paths = None
+    if partial_source_files is not None:
+        partial_paths = {resolved_source_path(path) for path in partial_source_files}
+        # A chunk that truncated to an EMPTY parse contributes no grouped items,
+        # so its file is absent from by_file and the write loop below would never
+        # stamp it partial — leaving a prior clean slice looking complete (#1950
+        # empty-parse gap). Seed an empty group for each named partial file that
+        # isn't already present, so the loop merges its existing entry and stamps
+        # it partial. Keyed by the resolved path (deduped against present groups).
+        _present = {resolved_source_path(k) for k in by_file}
+        for _pp in partial_paths:
+            if _pp not in _present:
+                by_file[str(_pp)]  # defaultdict: create an empty {nodes,edges,hyperedges}
 
     def group_skipped(fpath: str) -> bool:
         """Mirror the write-loop skip condition for one source_file group."""
@@ -898,14 +949,39 @@ def save_semantic_cache(
                 # then stamp the result as current-vintage — the exact mixing
                 # #1939 is about, made unfixable because the entry now claims a
                 # prompt that only produced half of it.
+                # allow_partial=True: a file split into slices across chunks
+                # accumulates here; if an earlier slice truncated, keep its nodes
+                # in the union AND let the entry stay partial (the _partial
+                # markers ride through, so is_partial below re-detects it) rather
+                # than a later clean slice silently replacing it and promoting the
+                # half-file to complete.
                 prev = load_cached(p, root, kind=kind, prompt=prompt,
-                                   prompt_file=prompt_file, allow_legacy=False)
+                                   prompt_file=prompt_file, allow_legacy=False,
+                                   allow_partial=True)
+                _prev_partial = bool(prev.get("partial")) if prev else False
                 if prev:
                     result = {
                         "nodes": (prev.get("nodes", []) or []) + result["nodes"],
                         "edges": (prev.get("edges", []) or []) + result["edges"],
                         "hyperedges": (prev.get("hyperedges", []) or []) + result["hyperedges"],
                     }
+            else:
+                _prev_partial = False
+            # A file is partial if the caller named it, any of its grouped items
+            # carries the intrinsic ``_partial`` marker, OR the entry it merged
+            # onto was already partial (an empty-parse truncation leaves a
+            # ``partial: True`` entry with no item markers, so a later clean slice
+            # merging over it must NOT silently promote the half-file to complete
+            # — #1950). Copy so the caller's dict is never mutated. A genuine
+            # complete re-extraction (merge_existing=False) overwrites the
+            # content-hash key with a non-partial entry that then serves normally.
+            is_partial = (
+                (partial_paths is not None and p in partial_paths)
+                or _group_has_partial_marker(result)
+                or _prev_partial
+            )
+            if is_partial:
+                result = {**result, "partial": True}
             save_cached(p, result, root, kind=kind, prompt=prompt, prompt_file=prompt_file)
             saved += 1
     return saved

@@ -58,11 +58,18 @@ def _stamped_manifest_files(
     files_by_type: dict[str, list[str]],
     sem_result: dict,
     root: Path,
+    partial_source_files: "set[str] | None" = None,
 ) -> dict[str, list[str]]:
     """Manifest-safe files dict: only stamp semantic files that actually
     produced output (cache hit or fresh extraction). Files whose chunk failed
     have no source_file entry in sem_result — leaving their semantic_hash
     empty so detect_incremental re-queues them (#933).
+
+    A file in ``partial_source_files`` DID produce output this run, but only a
+    truncated fragment of it, so it is excluded from stamping too — otherwise
+    detect_incremental would see it "done" and never re-dispatch it, leaving the
+    incomplete node set live forever on the warm-incremental path. Same #933
+    mechanism: leave it unstamped and it is re-queued next run.
 
     Both sides of the membership test are resolved against the scan ``root``
     before comparing (#1897): node/edge/hyperedge ``source_file`` values are
@@ -95,11 +102,13 @@ def _stamped_manifest_files(
             sf = item.get("source_file", "")
             if sf:
                 sem_extracted.add(_resolve(sf))
+    partial_resolved = {_resolve(p) for p in (partial_source_files or set())}
     sem_types = {"document", "paper", "image"}
     return {
         ftype: [
             f for f in flist
-            if ftype not in sem_types or _resolve(f) in sem_extracted
+            if ftype not in sem_types
+            or (_resolve(f) in sem_extracted and _resolve(f) not in partial_resolved)
         ]
         for ftype, flist in files_by_type.items()
     }
@@ -246,7 +255,8 @@ def _prune_graph_json_sources(graph_path: Path, stale_sources: list[str]) -> int
         data["hyperedges"] = kept_hyper
     from graphify.export import backup_if_protected as _backup
     _backup(graph_path.parent)
-    graph_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    from graphify.paths import write_json_atomic
+    write_json_atomic(graph_path, data, indent=2)
     return n_removed
 
 
@@ -1399,7 +1409,8 @@ def dispatch_command(cmd: str) -> None:
             encoding="utf-8",
         )
         to_json(G, communities, str(out / "graph.json"), community_labels=labels)
-        labels_path.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding="utf-8")
+        from graphify.paths import write_json_atomic as _wja
+        _wja(labels_path, {str(k): v for k, v in labels.items()}, ensure_ascii=False)
         # Membership signatures beside the labels so a later cluster-only can detect
         # which communities changed and avoid reusing a stale label (see reuse above).
         from graphify.cluster import community_member_sigs as _cms
@@ -1615,7 +1626,8 @@ def dispatch_command(cmd: str) -> None:
             out_data = _jg.node_link_data(merged, edges="links")
         except TypeError:
             out_data = _jg.node_link_data(merged)
-        Path(_current_path).write_text(json.dumps(out_data, indent=2), encoding="utf-8")
+        from graphify.paths import write_json_atomic
+        write_json_atomic(_current_path, out_data, indent=2)
         sys.exit(0)
 
     elif cmd == "merge-graphs":
@@ -1688,7 +1700,8 @@ def dispatch_command(cmd: str) -> None:
         except TypeError:
             out_data = _jg.node_link_data(merged)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(out_data, indent=2), encoding="utf-8")
+        from graphify.paths import write_json_atomic as _wja
+        _wja(out_path, out_data, indent=2)
         print(f"Merged {len(graphs)} graphs -> {merged.number_of_nodes()} nodes, {merged.number_of_edges()} edges")
         print(f"Written to: {out_path}")
 
@@ -2108,7 +2121,7 @@ def dispatch_command(cmd: str) -> None:
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
-                "[--api-timeout S] [--postgres DSN] [--cargo] [--timing]",
+                "[--api-timeout S] [--postgres DSN] [--cargo] [--allow-partial] [--timing]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -2129,6 +2142,7 @@ def dispatch_command(cmd: str) -> None:
         out_dir: Path | None = None
         cli_postgres_dsn: str | None = None
         cli_cargo: bool = False
+        cli_allow_partial: bool = False
         no_cluster = False
         dedup_llm = False
         google_workspace = False
@@ -2240,6 +2254,8 @@ def dispatch_command(cmd: str) -> None:
                 i += 1
             elif a == "--force":
                 force = True; i += 1
+            elif a == "--allow-partial":
+                cli_allow_partial = True; i += 1
             elif a == "--timing":
                 cli_timing = True; i += 1
             else:
@@ -2519,6 +2535,18 @@ def dispatch_command(cmd: str) -> None:
                     )
                     sys.exit(1)
 
+        # Track whether this run's extraction was incomplete (a whole extractor
+        # pass crashed, or some semantic chunks failed). A partial result must not
+        # be force-written over a good complete graph — the final write falls back
+        # to the #479 shrink guard unless --allow-partial is set.
+        _extraction_incomplete = False
+        # A walk that couldn't fully enumerate the corpus (permission-denied
+        # subtree, I/O error) yields a legitimately smaller graph that must not
+        # be force-written over a complete one — same failure class as a crashed
+        # pass. detect()/detect_incremental() already record these; consume them.
+        if detection.get("walk_errors"):
+            _extraction_incomplete = True
+
         # AST extraction on code files. Empty code list (docs-only corpus) is
         # the issue #698 case — skip cleanly instead of crashing inside extract().
         ast_result: dict = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
@@ -2536,6 +2564,7 @@ def dispatch_command(cmd: str) -> None:
             except Exception as exc:
                 print(f"[graphify extract] AST extraction failed: {exc}", file=sys.stderr)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+                _extraction_incomplete = True  # the whole AST pass was lost
         stages.mark("AST extract")
 
         # Semantic extraction on docs/papers/images. Check cache first.
@@ -2548,6 +2577,11 @@ def dispatch_command(cmd: str) -> None:
             "nodes": [], "edges": [], "hyperedges": [],
             "input_tokens": 0, "output_tokens": 0,
         }
+        # Semantic files whose extraction truncated this run. They are left
+        # unstamped in the manifest so detect_incremental re-queues them next run
+        # (mirrors the #933 failed-chunk handling); captured below before the
+        # _partial markers are stripped from the corpus.
+        _partial_semantic_files: set[str] = set()
         sem_cache_hits = 0
         sem_cache_misses = 0
         # Deep mode uses its own namespace (cache/semantic-deep/) so deep and
@@ -2622,6 +2656,7 @@ def dispatch_command(cmd: str) -> None:
                         file=sys.stderr,
                     )
                     fresh = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
+                    _extraction_incomplete = True  # the semantic pass crashed
 
                 # on_chunk_done only fires after a chunk succeeds. If fresh
                 # semantic extraction was requested and no chunks completed,
@@ -2635,6 +2670,21 @@ def dispatch_command(cmd: str) -> None:
                         file=sys.stderr,
                     )
                     sys.exit(1)
+                # Some (but not all) chunks failed — the graph is missing nodes
+                # from the failed chunks, so it must not clobber a larger complete
+                # graph without an explicit --allow-partial override.
+                if _chunk_stats["total"] and _chunk_stats["succeeded"] < _chunk_stats["total"]:
+                    _extraction_incomplete = True
+                # Which files truncated this run (item markers + the empty-parse
+                # _partial_files set). Computed BEFORE the save so it can be passed
+                # as partial_source_files: without it, a file whose only truncated
+                # chunk parsed empty (so it has no item markers here) would be
+                # written as a complete cache entry, re-promoting it (#1950).
+                from graphify.llm import (
+                    _partial_source_files as _partial_sf,
+                    _strip_partial_markers as _strip_partial,
+                )
+                _partial_semantic_files = set(_partial_sf(fresh))
                 try:
                     _save_semantic_cache(
                         fresh.get("nodes", []),
@@ -2644,9 +2694,13 @@ def dispatch_command(cmd: str) -> None:
                         allowed_source_files=uncached_paths,
                         mode=sem_cache_mode,
                         prompt=sem_prompt,
+                        partial_source_files=_partial_semantic_files or None,
                     )
                 except Exception as exc:
                     print(f"[graphify extract] warning: could not write semantic cache: {exc}", file=sys.stderr)
+                # Strip the markers before the corpus feeds the graph so the
+                # internal flag never leaks into graph.json.
+                _strip_partial(fresh)
                 sem_result["nodes"].extend(fresh.get("nodes", []))
                 sem_result["edges"].extend(fresh.get("edges", []))
                 sem_result["hyperedges"].extend(fresh.get("hyperedges", []))
@@ -2726,7 +2780,8 @@ def dispatch_command(cmd: str) -> None:
         # Path normalization against the scan root happens inside the helper
         # (#1897) so fresh root-relative source_files match detect()'s
         # absolute file lists.
-        _manifest_files = _stamped_manifest_files(files_by_type, sem_result, target)
+        _manifest_files = _stamped_manifest_files(files_by_type, sem_result, target,
+                                                   partial_source_files=_partial_semantic_files)
 
         # Full-scan manifest saves prune rows for in-root files that left the
         # scan corpus but still exist on disk (#1908). The corpus must be the
@@ -2746,7 +2801,10 @@ def dispatch_command(cmd: str) -> None:
             # across modes (#1317; node dedup also collapses shared Swift module
             # anchors emitted per importing file, #1327).
             from graphify.build import dedupe_edges as _dedupe_edges, dedupe_nodes as _dedupe_nodes
-            from graphify.export import backup_if_protected as _backup
+            from graphify.export import (
+                backup_if_protected as _backup,
+                existing_graph_node_count as _existing_graph_node_count,
+            )
             if (
                 incremental_mode
                 and not code_files
@@ -2792,10 +2850,35 @@ def dispatch_command(cmd: str) -> None:
                     _e["source_file"] = (
                         _node_sf.get(_e.get("source")) or _node_sf.get(_e.get("target")) or ""
                     )
+            # RT-parity for the raw path: an incomplete build must not force a
+            # partial graph over a larger complete one here either. The clustered
+            # path gets this from to_json's #479 guard; this path never calls
+            # to_json, so replicate the shrink check against the existing file and
+            # exit before the write/manifest unless --allow-partial is set.
+            if _extraction_incomplete and not cli_allow_partial:
+                from graphify.export import MALFORMED_GRAPH as _MALFORMED_GRAPH
+                _existing_n = _existing_graph_node_count(graph_json_path)
+                _malformed = _existing_n is _MALFORMED_GRAPH
+                _shrinks = isinstance(_existing_n, int) and len(merged["nodes"]) < _existing_n
+                if _malformed or _shrinks:
+                    _detail = (
+                        f"the existing {graph_json_path} is present but unparseable "
+                        "(corrupt or a mid-write), so a shrink cannot be ruled out"
+                        if _malformed
+                        else f"smaller than the existing {graph_json_path} "
+                        f"({len(merged['nodes'])} < {_existing_n} nodes)"
+                    )
+                    print(
+                        "[graphify extract] error: extraction was incomplete (an AST/"
+                        f"semantic pass failed) and the resulting --no-cluster graph is {_detail}. "
+                        "Refusing to overwrite a complete graph with a partial one. Re-run after "
+                        "fixing the failures, or pass --allow-partial to overwrite anyway.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
             _backup(graphify_out)
-            graph_json_path.write_text(
-                json.dumps(merged, indent=2), encoding="utf-8"
-            )
+            from graphify.paths import write_json_atomic as _write_json_atomic
+            _write_json_atomic(graph_json_path, merged, indent=2)
             stages.mark("write")
             cost = _estimate_cost(
                 backend, merged["input_tokens"], merged["output_tokens"]
@@ -2885,7 +2968,41 @@ def dispatch_command(cmd: str) -> None:
 
         from graphify.export import backup_if_protected as _backup
         _backup(graphify_out)
-        _to_json(G, communities, str(graph_json_path), force=True)
+        # force=True bypasses the #479 shrink guard entirely. A full build
+        # legitimately shrinks (fuzzy dedup collapse, deleted code) so it keeps
+        # force=True — EXCEPT when this run's extraction was incomplete (an
+        # extractor pass crashed or some semantic chunks failed). Then a partial
+        # graph could silently overwrite a good complete one, so fall back to the
+        # shrink guard (force=False) unless the user opts in with --allow-partial.
+        #
+        # Both write paths are guarded: the clustered path here via to_json's
+        # #479 check, and the `--no-cluster` raw-dump path above via the same
+        # shrink check against the existing file (existing_graph_node_count).
+        #
+        # Trade-off: this reuses to_json's coarse node-count guard, not the
+        # source-aware _check_shrink that watch/update use. On an incremental run
+        # a legitimate deletion that coincides with an unrelated transient chunk
+        # failure can therefore be refused here — recoverable by re-running or
+        # passing --allow-partial (the good graph is preserved and the manifest
+        # is not stamped, so the retry re-extracts).
+        _force_write = cli_allow_partial or not _extraction_incomplete
+        _wrote = _to_json(G, communities, str(graph_json_path), force=_force_write)
+        if not _wrote:
+            # The shrink guard refused: this partial build is smaller than the
+            # existing graph. Exit before writing the manifest/marker below, which
+            # would otherwise stamp these files as done and make the next
+            # incremental run skip re-extracting them (poisoning the manifest
+            # against the graph we declined to write). Exit non-zero so a retry
+            # re-attempts.
+            print(
+                "[graphify extract] error: extraction was incomplete (an AST/semantic "
+                f"pass failed) and the resulting graph is smaller than the existing "
+                f"{graph_json_path}. Refusing to overwrite a complete graph with a "
+                "partial one. Re-run after fixing the failures, or pass --allow-partial "
+                "to overwrite anyway.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         stages.mark("export")
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(
@@ -2913,7 +3030,8 @@ def dispatch_command(cmd: str) -> None:
                 "output": merged["output_tokens"],
             },
         }
-        analysis_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
+        from graphify.paths import write_json_atomic as _wja
+        _wja(analysis_path, analysis, indent=2)
         try:
             _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus)
         except Exception as exc:
@@ -3040,11 +3158,23 @@ def dispatch_command(cmd: str) -> None:
             chunk_files.extend(sorted(expanded) if expanded else [arg])
         merged: dict = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
         seen_ids: set[str] = set()
+        # These chunk files are untrusted subagent output. load_validated_...
+        # stats the file size BEFORE reading it (so a multi-GB chunk can't blow up
+        # memory), parses the JSON, and validates the security caps + the node/
+        # edge id charset that blocks path traversal (#825) — the same enforcement
+        # the skill merge path applies. A bad chunk is skipped with a warning
+        # (filter semantics; never abort). Deliberately NOT wired into
+        # build_from_json/load_graph_json, which must keep loading valid
+        # pre-existing graphs. file_type is left to build's coercion (#840).
+        from graphify.semantic_cleanup import load_validated_semantic_fragment
         for cf in chunk_files:
-            try:
-                chunk = json.loads(Path(cf).read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as exc:
-                print(f"[graphify merge-chunks] warning: skipping {cf}: {exc}", file=sys.stderr)
+            chunk, _chunk_errs = load_validated_semantic_fragment(Path(cf))
+            if _chunk_errs:
+                print(
+                    f"[graphify merge-chunks] warning: skipping invalid chunk {cf}: "
+                    f"{'; '.join(_chunk_errs[:3])}",
+                    file=sys.stderr,
+                )
                 continue
             for n in chunk.get("nodes", []):
                 if n.get("id") not in seen_ids:
@@ -3052,10 +3182,15 @@ def dispatch_command(cmd: str) -> None:
                     merged["nodes"].append(n)
             merged["edges"].extend(chunk.get("edges", []))
             merged["hyperedges"].extend(chunk.get("hyperedges", []))
-            merged["input_tokens"] += chunk.get("input_tokens", 0)
-            merged["output_tokens"] += chunk.get("output_tokens", 0)
+            # Coerce token counts: a chunk is untrusted, so a non-numeric
+            # input_tokens/output_tokens must not abort the whole merge with a
+            # TypeError after other chunks already merged.
+            for _tok in ("input_tokens", "output_tokens"):
+                _v = chunk.get(_tok, 0)
+                merged[_tok] += _v if isinstance(_v, (int, float)) else 0
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        from graphify.paths import write_json_atomic as _wja
+        _wja(out_path, merged, ensure_ascii=False)
         print(
             f"Merged {len(chunk_files)} chunks: {len(merged['nodes'])} nodes, {len(merged['edges'])} edges, "
             f"{merged['input_tokens']:,} in / {merged['output_tokens']:,} out tokens"
@@ -3099,7 +3234,8 @@ def dispatch_command(cmd: str) -> None:
             "hyperedges": cached_data.get("hyperedges", []) + new_data.get("hyperedges", []),
         }
         out_path2.parent.mkdir(parents=True, exist_ok=True)
-        out_path2.write_text(json.dumps(merged2, ensure_ascii=False), encoding="utf-8")
+        from graphify.paths import write_json_atomic as _wja
+        _wja(out_path2, merged2, ensure_ascii=False)
         print(f"Merged: {len(merged2['nodes'])} nodes, {len(merged2['edges'])} edges")
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
