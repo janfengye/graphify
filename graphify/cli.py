@@ -134,9 +134,11 @@ def _stale_graph_sources(
     (--include sources, symlinked external corpora) are never walked by
     detect, so their absence from the corpus is not staleness evidence.
     Relative entries are re-anchored against both the scan root and the
-    graph's own output root (``--out`` extracts store source_files relative
-    to the OUT root, e.g. ``../project/x.py``, #555/#1899); only anchors
-    that land inside the scan root count.
+    graph's own output root; only anchors that land inside the scan root
+    count. Since #1941 extracts always store source_file relative to the SCAN
+    root, so the scan-root anchor is the live one; the out-root anchor stays
+    for graphs written by <=0.9.16, which stored them relative to the OUT root
+    (e.g. ``../project/x.py``, #555/#1899).
     ``seen_files`` must be the FULL detect output including unclassified
     files, so nodes from walked-but-unsupported sources (e.g. introspected
     Cargo.toml manifests) are not misread as stale.
@@ -2555,7 +2557,9 @@ def dispatch_command(cmd: str) -> None:
             # Anchor the cache at the output root, not the scanned project:
             # with --out, a <target>/graphify-out/cache/ would leak a
             # graphify-out/ dir into a project that asked for external output.
-            ast_kwargs: dict = {"cache_root": out_root}
+            # `root` stays the scanned project so source_file/ids relativize
+            # against it; conflating the two basenamed every node (#1941).
+            ast_kwargs: dict = {"cache_root": out_root, "root": target}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
             print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
@@ -2783,6 +2787,22 @@ def dispatch_command(cmd: str) -> None:
         _manifest_files = _stamped_manifest_files(files_by_type, sem_result, target,
                                                    partial_source_files=_partial_semantic_files)
 
+        # Files dispatched this run but dropped by _stamped_manifest_files
+        # above (failed chunk, LLM omission, or any future exclusion) still
+        # carry a stale semantic_hash from a prior successful run in the
+        # on-disk manifest; save_manifest's seed loop would otherwise copy it
+        # verbatim and mask the omission (#1948). Derived from semantic_files
+        # — what was actually SENT to the backend this run (narrowed by the
+        # incremental gate and --code-only, widened by deep mode) — NOT from
+        # files_by_type: the full live corpus includes untouched files that
+        # were never dispatched, and clearing those would blank the whole
+        # manifest on every partial incremental run, forcing a full-corpus
+        # re-extraction on the next one.
+        _stamped_semantic = {
+            f for _flist in _manifest_files.values() for f in _flist
+        }
+        _cleared_semantic = {str(p) for p in semantic_files} - _stamped_semantic
+
         # Full-scan manifest saves prune rows for in-root files that left the
         # scan corpus but still exist on disk (#1908). The corpus must be the
         # RAW detect output (files_by_type), NOT the #933-stamp-filtered
@@ -2834,7 +2854,7 @@ def dispatch_command(cmd: str) -> None:
                     "(--no-cluster); outputs left untouched."
                 )
                 try:
-                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus)
+                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic)
                 except Exception as exc:
                     print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
                 stages.total()
@@ -2896,7 +2916,7 @@ def dispatch_command(cmd: str) -> None:
                     f"est. cost: ${cost:.4f}"
                 )
             try:
-                _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus)
+                _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic)
             except Exception as exc:
                 print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
             if global_merge:
@@ -3033,7 +3053,7 @@ def dispatch_command(cmd: str) -> None:
         from graphify.paths import write_json_atomic as _wja
         _wja(analysis_path, analysis, indent=2)
         try:
-            _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus)
+            _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic)
         except Exception as exc:
             print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
 
@@ -3158,12 +3178,15 @@ def dispatch_command(cmd: str) -> None:
             chunk_files.extend(sorted(expanded) if expanded else [arg])
         merged: dict = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}
         seen_ids: set[str] = set()
+        valid_chunks = 0
         # These chunk files are untrusted subagent output. load_validated_...
         # stats the file size BEFORE reading it (so a multi-GB chunk can't blow up
         # memory), parses the JSON, and validates the security caps + the node/
         # edge id charset that blocks path traversal (#825) — the same enforcement
         # the skill merge path applies. A bad chunk is skipped with a warning
-        # (filter semantics; never abort). Deliberately NOT wired into
+        # while valid siblings still merge; if every chunk is invalid, fail
+        # closed instead of reporting success and replacing --out with an empty
+        # semantic layer. Deliberately NOT wired into
         # build_from_json/load_graph_json, which must keep loading valid
         # pre-existing graphs. file_type is left to build's coercion (#840).
         from graphify.semantic_cleanup import load_validated_semantic_fragment
@@ -3176,6 +3199,7 @@ def dispatch_command(cmd: str) -> None:
                     file=sys.stderr,
                 )
                 continue
+            valid_chunks += 1
             for n in chunk.get("nodes", []):
                 if n.get("id") not in seen_ids:
                     seen_ids.add(n["id"])
@@ -3188,11 +3212,23 @@ def dispatch_command(cmd: str) -> None:
             for _tok in ("input_tokens", "output_tokens"):
                 _v = chunk.get(_tok, 0)
                 merged[_tok] += _v if isinstance(_v, (int, float)) else 0
+        if not valid_chunks:
+            print(
+                f"[graphify merge-chunks] error: no valid chunks to merge; "
+                f"refusing to write {out_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         from graphify.paths import write_json_atomic as _wja
         _wja(out_path, merged, ensure_ascii=False)
+        chunk_summary = (
+            f"{valid_chunks} chunks"
+            if valid_chunks == len(chunk_files)
+            else f"{valid_chunks} of {len(chunk_files)} chunks"
+        )
         print(
-            f"Merged {len(chunk_files)} chunks: {len(merged['nodes'])} nodes, {len(merged['edges'])} edges, "
+            f"Merged {chunk_summary}: {len(merged['nodes'])} nodes, {len(merged['edges'])} edges, "
             f"{merged['input_tokens']:,} in / {merged['output_tokens']:,} out tokens"
         )
 
