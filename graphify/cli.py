@@ -818,6 +818,21 @@ def dispatch_command(cmd: str) -> None:
             _raw = _json.loads(gp.read_text(encoding="utf-8"))
             if "links" not in _raw and "edges" in _raw:
                 _raw = dict(_raw, links=_raw["edges"])
+            # `query` deliberately keeps the graph undirected (unlike `path` /
+            # `explain`, which force directed=True): BFS/DFS here must explore
+            # both callers and callees of the seed node to build useful
+            # context, and forcing a DiGraph would make G.neighbors() return
+            # successors only, silently dropping every caller-side result for
+            # a seed with no outgoing edges. Direction is instead preserved
+            # per-edge below (mirrors graphify/build.py's _src/_tgt pattern)
+            # so the *rendering* stays correct without narrowing traversal.
+            _raw = dict(
+                _raw,
+                links=[
+                    {**link, "_src": link.get("source"), "_tgt": link.get("target")}
+                    for link in _raw.get("links", [])
+                ],
+            )
             try:
                 G = json_graph.node_link_graph(_raw, edges="links")
             except TypeError:
@@ -2427,7 +2442,7 @@ def dispatch_command(cmd: str) -> None:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR|--output DIR] [--google-workspace] [--no-cluster] "
-                "[--no-gitignore] "
+                "[--no-gitignore] [--code-only] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo] [--allow-partial] [--timing]",
                 file=sys.stderr,
