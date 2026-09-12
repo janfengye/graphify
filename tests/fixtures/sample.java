@@ -1,11 +1,7 @@
 import java.util.List;
 import java.util.ArrayList;
 
-class BaseProcessor {}
-
-class Result<T> {}
-
-public class DataProcessor extends BaseProcessor implements Processor {
+public class DataProcessor {
     private List<String> items;
 
     public DataProcessor() {
@@ -18,11 +14,6 @@ public class DataProcessor extends BaseProcessor implements Processor {
 
     public List<String> process() {
         return validate(items);
-    }
-
-    @Override
-    public Result<DataProcessor> build(HttpClient client) {
-        return null;
     }
 
     private List<String> validate(List<String> data) {
@@ -38,15 +29,4 @@ public class DataProcessor extends BaseProcessor implements Processor {
 
 interface Processor {
     List<String> process();
-}
-
-enum ErrorCode {
-    OK(0),
-    GAME_DONE(1001);
-
-    private final int code;
-
-    ErrorCode(int code) {
-        this.code = code;
-    }
 }

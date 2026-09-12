@@ -1,18 +1,10 @@
 use std::collections::HashMap;
 
-pub static RETRY_LIMIT: usize = 3;
-pub const DEFAULT_MODE: &str = "fast";
-const NODE_LIMIT: Limit = Limit(3);
-
-struct Limit(usize);
-
 struct Graph {
     nodes: HashMap<String, Vec<String>>,
 }
 
 impl Graph {
-    const CAPACITY: usize = 16;
-
     fn new() -> Self {
         Graph { nodes: HashMap::new() }
     }
@@ -33,36 +25,3 @@ fn build_graph(edges: Vec<(String, String)>) -> Graph {
     }
     g
 }
-
-trait Processor {
-    fn run(&self);
-}
-
-trait Logger: Processor {
-    fn log(&self);
-}
-
-struct Result<T> {
-    value: T,
-}
-
-struct DataProcessor {
-    current: Result<DataProcessor>,
-}
-
-impl Processor for DataProcessor {
-    fn run(&self) {}
-}
-
-impl DataProcessor {
-    fn build(input: DataProcessor) -> Result<DataProcessor> {
-        Result { value: input }
-    }
-}
-
-enum GraphEvent {
-    NodeAdded(Graph),
-    Processed { proc: DataProcessor },
-}
-
-struct GraphPair(Graph, Result<DataProcessor>);

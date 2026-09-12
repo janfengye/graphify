@@ -21,34 +21,6 @@ func (s *Server) Stop() {
     fmt.Println("stopped")
 }
 
-type Logger interface {
-    Log(msg string)
-}
-
-type Reader interface {
-    Read() string
-}
-
-type ReaderLogger interface {
-    Logger
-    Reader
-}
-
-type BaseProcessor struct{}
-
-type Result struct {
-    value int
-}
-
-type DataProcessor struct {
-    BaseProcessor
-    current *Result
-}
-
-func (d *DataProcessor) Build(input *DataProcessor) (*Result, error) {
-    return nil, nil
-}
-
 func main() {
     s := NewServer(8080)
     s.Start()
