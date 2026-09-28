@@ -2,6 +2,17 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.71 (2026-09-28)
+
+- Feature: SQL `CREATE TRIGGER` statements are now extracted and linked to their table (`ON <table>`), including `OR REPLACE`/`OR ALTER`, `INSTEAD OF`, and procedural `BEGIN…END` bodies that previously landed in a parser-error node and were dropped (#3863, thanks @rajatnagda45).
+- Feature: Groovy `enum` declarations and their constants are extracted, with members linked to the enum via `case_of` (#3861, thanks @rajatnagda45).
+- Fix: R class definitions created via a namespace-qualified constructor (`R6::R6Class`, `methods::setRefClass`) are now recognised, so the class body and its methods are no longer dropped (#3864, thanks @rajatnagda45).
+- Fix: R6 intra-class calls through `self$method()` and `private$method()` now resolve to the sibling method instead of dangling; `super$` is left unresolved (single-file dispatch is not visible) (#3865, thanks @rajatnagda45).
+- Fix: the markdown wikilink index now respects `.graphifyignore`/`.gitignore`/`--exclude` — it no longer descends huge ignored trees when building the `[[link]]` index, and a wikilink can no longer resolve into an ignored file (#3826, #3822, thanks @Abhirup0).
+- Fix: manifest re-anchoring keeps a foreign-platform key in its own path syntax (a POSIX key on Windows, a `C:\`/UNC key on POSIX) using `posixpath`/`ntpath` rather than the host's rules, fixing separator corruption introduced by the 0.9.69 portability work (#3879, thanks @Dakshcore).
+- Fix: normalizing a Twitter/X URL for the oEmbed fetch rewrites only the host, so `x.com`/`twitter.com` appearing in the path or query is no longer corrupted (#3880, thanks @Dakshcore).
+- Chore: `graphify install` shows the refreshed graphify logo banner (#3892, thanks @rajarshidattapy).
+
 ## 0.9.70 (2026-09-27)
 
 - Security: the Fortran capital-F cpp step no longer allows an untrusted `.F`/`.F90` source to read arbitrary host files. `-nostdinc -I /dev/null` did not stop cpp from resolving absolute (`#include "/etc/passwd"`) or traversing (`#include "../../../secret"`) includes, which inlined host-file contents into `graph.json`/`GRAPH_REPORT.md` and the LLM context on the default offline path. Every `#include` directive is now stripped before preprocessing and the source is fed to cpp on stdin; macro expansion is preserved (GHSA-pcc4-rvhr-2pr8, CWE-22/73/200).
