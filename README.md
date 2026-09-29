@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <b>Early access to the graphify platform is open before the public v1 launch: <a href="https://app.graphify.com/login">app.graphify.com</a></b>
+  <b>Try the graphify platform free for 14 days: <a href="https://app.graphify.com/login">app.graphify.com</a></b>
 </p>
 
 Type `/graphify` in your AI coding assistant and it maps your entire project (code, docs, PDFs, images, videos) into a **knowledge graph** you can **query instead of grepping** through files.
@@ -874,6 +874,16 @@ Built for people and teams whose work lives across hundreds of conversations and
 Contributions are welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the development setup, the test and CI-parity commands, the git workflow, and what makes a strong contribution (worked examples and extraction bug reports are the most useful). Architecture and how to add a language: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 New here? Say hi on [Discord](https://discord.gg/XDnKVpzdXB) or in [GitHub Discussions](https://github.com/Graphify-Labs/graphify/discussions).
+
+---
+
+## Contributors
+
+<a href="https://github.com/Graphify-Labs/graphify/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Graphify-Labs/graphify" alt="graphify contributors" />
+</a>
+
+Made with [contrib.rocks](https://contrib.rocks).
 
 ---
 

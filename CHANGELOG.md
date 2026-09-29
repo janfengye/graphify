@@ -2,6 +2,15 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.72 (2026-09-28)
+
+- Fix: `docx` sidecar conversion now keeps tables in their document position (instead of dumping them after all prose) and reads all text, including tracked insertions, content controls, and text boxes, by walking the document body in order (#3833, thanks @L4XB).
+- Fix: label/signature sidecars are now published atomically and in a safe order (labels before signatures), so an interrupted rebuild can no longer leave stale community labels for a clustering that no longer exists (#3853, thanks @shashank-100).
+- Fix: the markdown wikilink index respects `.graphifyignore`/`.gitignore`/`--exclude` and resolves an article-named `index` without overwriting the generated `index.md` hub — two independent wiki/markdown fixes (#3818, thanks @breken-ai; escaped-alias parsing `[[target\|alias]]` #3772, thanks @zagushka).
+- Fix: the community listing in `GRAPH_REPORT.md` reuses the shared real-node filter, so `rationale`/`concept` nodes no longer inflate a community's node count or leak into the listing (#3836, #3794, thanks @ayushcodes10).
+- Fix: extraction now warns once (not per file) when a PDF is encountered but the `pdf` extra (`pypdf`) is not installed, instead of silently producing no text (#3710, #3702, thanks @shobhitagnihotri69).
+- Chore: `graphify` / `graphify --help` now shows the logo banner and a link to the hosted platform at app.graphify.com.
+
 ## 0.9.71 (2026-09-28)
 
 - Feature: SQL `CREATE TRIGGER` statements are now extracted and linked to their table (`ON <table>`), including `OR REPLACE`/`OR ALTER`, `INSTEAD OF`, and procedural `BEGIN…END` bodies that previously landed in a parser-error node and were dropped (#3863, thanks @rajatnagda45).

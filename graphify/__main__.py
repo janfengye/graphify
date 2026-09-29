@@ -604,6 +604,7 @@ def _run_cli() -> None:
         return
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "-?"):
+        _print_banner()
         print("Usage: graphify <command>")
         print()
         print("Commands:")
@@ -805,6 +806,9 @@ def _run_cli() -> None:
         print("  pi uninstall            remove skill from ~/.pi/agent/skills/graphify/")
         print("  devin install           write skill to ~/.config/devin/skills/graphify/ (Devin CLI)")
         print("  devin uninstall         remove skill from ~/.config/devin/skills/graphify/")
+        print()
+        print("Prefer a hosted version? Try the graphify platform free for 14 days:")
+        print("https://app.graphify.com")
         print()
         return
 
