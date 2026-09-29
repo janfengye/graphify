@@ -2,8 +2,15 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
-## 0.9.72 (2026-09-28)
+## 0.9.72 (2026-09-29)
 
+- Feature: after a package upgrade, `graphify` refreshes stale installed skills automatically (the `SKILL.md` + references sidecar it manages) so the version-mismatch warning no longer requires a manual `graphify install`. It runs on any non-install CLI command when a skill is stale, backs up local edits to `SKILL.md.bak`, never touches your marker-bounded `CLAUDE.md`/`AGENTS.md`/`GEMINI.md` sections, and can be disabled with `GRAPHIFY_NO_AUTO_REFRESH=1` (#3895, #1805, thanks @bercedev).
+- Fix: `graph.html`'s Node Info panel now shows the real Type/Source/Community for each node instead of "Type: unknown / Source: -" (the panel read field names that did not match the emitted node schema); aggregated community nodes show a member count (#3918, #3914, thanks @hopstreax).
+- Fix: a Kotlin class property that is both annotated and has an inferred type (`@Volatile var x = 0`) no longer crashes extraction with an `UnboundLocalError` that dropped the whole file (#3915, thanks @nothariharan; #3899, thanks @harshaygadekar; #3884).
+- Fix: SQL DDL that appears before a PostgreSQL `DO $$ ... $$` block is now extracted — the block node the parser produces for that span is walked instead of skipped (#3900, thanks @bercedev).
+- Fix: Razor extracts C# members from `@functions { }` blocks (classic Razor Pages/MVC), not only Blazor `@code { }` blocks (#3908, thanks @rajatnagda45).
+- Feature: Blade templates now link a view to the layout it `@extends` (#3907, thanks @rajatnagda45).
+- Fix: resolving an imported module name no longer binds to a same-named contained symbol (a class/module member); only genuine top-level module/file nodes are considered (#3898, #3887, thanks @harshaygadekar).
 - Fix: `docx` sidecar conversion now keeps tables in their document position (instead of dumping them after all prose) and reads all text, including tracked insertions, content controls, and text boxes, by walking the document body in order (#3833, thanks @L4XB).
 - Fix: label/signature sidecars are now published atomically and in a safe order (labels before signatures), so an interrupted rebuild can no longer leave stale community labels for a clustering that no longer exists (#3853, thanks @shashank-100).
 - Fix: the markdown wikilink index respects `.graphifyignore`/`.gitignore`/`--exclude` and resolves an article-named `index` without overwriting the generated `index.md` hub — two independent wiki/markdown fixes (#3818, thanks @breken-ai; escaped-alias parsing `[[target\|alias]]` #3772, thanks @zagushka).
