@@ -904,18 +904,7 @@ Made with [contrib.rocks](https://contrib.rocks).
 
 ## Translations
 
-The README is maintained in 32 languages. Help us improve a translation, or add a new one, by opening a pull request against the matching file in [`docs/translations/`](docs/translations/).
-
-| | | | |
-| --- | --- | --- | --- |
-| [🇺🇸 English](README.md) | [🇨🇳 简体中文](docs/translations/README.zh-CN.md) | [🇹🇼 繁體中文](docs/translations/README.zh-TW.md) | [🇯🇵 日本語](docs/translations/README.ja-JP.md) |
-| [🇰🇷 한국어](docs/translations/README.ko-KR.md) | [🇩🇪 Deutsch](docs/translations/README.de-DE.md) | [🇫🇷 Français](docs/translations/README.fr-FR.md) | [🇪🇸 Español](docs/translations/README.es-ES.md) |
-| [🇮🇳 हिन्दी](docs/translations/README.hi-IN.md) | [🇧🇷 Português](docs/translations/README.pt-BR.md) | [🇷🇺 Русский](docs/translations/README.ru-RU.md) | [🇸🇦 العربية](docs/translations/README.ar-SA.md) |
-| [🇮🇷 فارسی](docs/translations/README.fa-IR.md) | [🇮🇹 Italiano](docs/translations/README.it-IT.md) | [🇵🇱 Polski](docs/translations/README.pl-PL.md) | [🇳🇱 Nederlands](docs/translations/README.nl-NL.md) |
-| [🇹🇷 Türkçe](docs/translations/README.tr-TR.md) | [🇺🇦 Українська](docs/translations/README.uk-UA.md) | [🇻🇳 Tiếng Việt](docs/translations/README.vi-VN.md) | [🇮🇩 Bahasa Indonesia](docs/translations/README.id-ID.md) |
-| [🇸🇪 Svenska](docs/translations/README.sv-SE.md) | [🇬🇷 Ελληνικά](docs/translations/README.el-GR.md) | [🇷🇴 Română](docs/translations/README.ro-RO.md) | [🇨🇿 Čeština](docs/translations/README.cs-CZ.md) |
-| [🇫🇮 Suomi](docs/translations/README.fi-FI.md) | [🇩🇰 Dansk](docs/translations/README.da-DK.md) | [🇳🇴 Norsk](docs/translations/README.no-NO.md) | [🇭🇺 Magyar](docs/translations/README.hu-HU.md) |
-| [🇹🇭 ภาษาไทย](docs/translations/README.th-TH.md) | [🇺🇿 Oʻzbekcha](docs/translations/README.uz-UZ.md) | [🇵🇭 Filipino](docs/translations/README.fil-PH.md) | [🇮🇱 עברית](docs/translations/README.he-IL.md) |
+The README is available in 32 languages. Use the language switcher at the top of this file to read it in yours, or browse [`docs/translations/`](docs/translations/). To improve a translation or add a new one, open a pull request against the matching file there.
 
 ---
 
