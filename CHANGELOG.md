@@ -2,6 +2,26 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.77 (2026-10-05)
+
+More community language-structure coverage, two reload/incremental correctness fixes, and a batch of extractor tests.
+
+- Feature: four more language extractors gained type coverage from @rajatnagda45 — **Solidity** enum values link via `case_of` instead of `contains` (#4090), **PowerShell** enum members likewise (which also stops a member named like a type binding as a constructor) (#4092), **Objective-C** C-style `enum` and `typedef enum` declarations are extracted with their members (#4096), and a **SQL** trigger is linked to the function it executes with an `executes` edge (#4094).
+- Feature: **Scala** class-level context bounds (`class C[A: Ordering]`) now resolve to `references` edges, mirroring the method-level handling from 0.9.75 (#4085, #4080, thanks @Mpasha17).
+- Fix: **Astro** files terminate a trailing `//` comment in one `<script>` block so it no longer swallows the next block on the same line; byte offsets and line numbers are preserved (#4083, #4072, thanks @Sourya-Prabaharan).
+- Fix: a zero-byte source file keeps its node but no longer claims a line-1 source location, so an empty `__init__.py` is still a real module without a misleading anchor (#4086, #4041, thanks @Mpasha17).
+- Fix: **PHP** calls to a method whose name collides with a cross-language builtin (`$this->list()`, `$this->open()`) now resolve against the caller's own class instead of being dropped, while non-`$this` receivers and bare construct names stay fail-closed (#4119, refines #3975 and #3381, thanks @xiehuanyi).
+- Fix: **JavaScript** methods attached to an exported object (`res.format = function () {...}; module.exports = res`) are now extracted as nodes, so calls inside them resolve across CommonJS/ESM module boundaries (#4121, #3778, thanks @harshaygadekar).
+- Fix: incremental `graphify update` on a subfolder no longer false-reports files in sibling folders as deleted; a shared single manifest now anchors stored paths to its base and scopes deletion detection to the scanned root (#4118, #3785, thanks @harshaygadekar).
+- Fix: reloading a saved `graph.json` preserves stored edge direction across the HTML, Cypher, Neo4j, FalkorDB, and Obsidian-canvas exporters, the watch HTML re-render, and the merge driver, instead of reversing edges whose target precedes their source in the node list (#4088, #4066, thanks @e4c5).
+- Fix: **PowerShell** method calls are now recorded — `$this.Method()` and `[Type]::Method()` resolve to the method node by name, keyed only on method-labelled targets so a free function sharing the name is never bound, and unresolved names stay fail-closed (#3995, thanks @rajatnagda45).
+- Fix: **Rust** anonymous constants (`const _: () = assert!(...)`) no longer collapse onto the file node and emit a self-loop; the anonymous item is skipped while named consts and statics keep their nodes (#4108, #4064, thanks @xiehuanyi).
+- Fix: a cleanly-parsed source file on a different drive from the scan root no longer aborts the whole extraction on Windows; the symbol-free-file warning falls back to an absolute display path instead of raising (#4106, #4059, thanks @xiehuanyi).
+- Fix: `--no-dedup` now also disables the same-file ghost-merge pass in `build_from_json`, so two distinct non-AST nodes sharing a `(source_file, label)` are preserved when dedup is turned off; AST reconciliation and the default dedup path are unchanged (#4122, #4019, thanks @xiehuanyi).
+- Fix: a second `/graphify` run on an unchanged mixed corpus no longer crashes with a missing `.graphify_semantic.json`; when every semantic file is cached the skill still runs Step B3's merge (and clears stale chunk files first) so Part C always has its input (#4117, #4116, thanks @brunovima83).
+- Test: extractor coverage was extended for **Pascal** valued enums (#4104, thanks @MalikHaroonKhokhar), **C#** `this?.M()` null-conditional self calls (#4105) and **Zig** tagged-union nested-struct payloads (#4107, thanks @Jarvis-J-Jacob), **Kotlin** annotation class-literal boundaries (#4112) and cross-language JVM inheritance (#4113) plus **C++** union method-versus-field edges (#4114, thanks @xiehuanyi), **Elixir** `defguardp` private guards (#4084, thanks @ClockZW), and **bash** `source`/`.` imports plus `merge-graphs --previous` node pruning (#4097, #4081, #4078, thanks @akshitj11).
+- Docs: the code-intelligence benchmark result is surfaced in the README and BENCHMARKS summary tables (key-fact coverage 82.0% vs a 70.8% grep-and-read baseline, n=6) (#4109, thanks @Mr-Neutr0n).
+
 ## 0.9.76 (2026-10-04)
 
 More language-structure coverage, resolution/dedup correctness, and a security fix for the git-hook installer.
