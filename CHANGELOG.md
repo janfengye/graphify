@@ -2,6 +2,26 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.79 (2026-10-06)
+
+- Fix: incremental `graphify update` and `watch` no longer re-cluster and re-render on every run after an unchanged rebuild. The `schema_version`/`graphify_version` metadata added to `graph.json` in 0.9.78 (#4167) was being counted as a topology change by the watch unchanged-topology check, since the freshly-built candidate graph carries no such metadata; it is now excluded from the comparison.
+
+## 0.9.78 (2026-10-06)
+
+A determinism and portability batch: node ids no longer leak the checkout path, OS username, or line endings into graph.json, so a clone produces the same graph everywhere. Plus encoding, C#, PowerShell, C++, and watch-reconcile correctness fixes.
+
+- Fix: node ids no longer embed the local checkout path or OS username for unresolved targets — a missing `require('./x')` (#4155, #4154), a missing Python relative import `from .absent import x` (#4157, #4156), and a `.dmf` element keyed on its window (#4153, #4152) now mint portable, clone-identical ids; all three thanks @rohit-jsfreaky.
+- Fix: **C#** namespace scope ids are keyed on row/column instead of byte offset, so a CRLF checkout no longer writes different `scope_chain` metadata than an LF one (#4165, #4164, thanks @rohit-jsfreaky).
+- Fix: **R** symbol-only bindings (operators like `` `%||%` ``) no longer collapse onto the file node and spin `resolve_local` forever; they get a stable, collision-free id (#4171, #4162, thanks @xiehuanyi).
+- Fix: source files are decoded before parsing — a UTF-16 file no longer yields zero nodes and a cp1252 name like `CaféOrder` is no longer truncated; valid UTF-8 files are byte-for-byte unchanged, non-UTF-8 falls back deterministically (#4146, #4145, thanks @rohit-jsfreaky).
+- Fix: **C#** calls through a cast or an interface-typed property now resolve — `((IStore)x).Save()`, `(x as IStore).Save()`, and a shadowed `IStore Store => ...; Store.Save()` bind to the interface's own method instead of being dropped or mis-bound to the concrete class (#4172, #3797, thanks @Mpasha17).
+- Fix: **PowerShell** member calls bind by receiver owner rather than method name alone — `$this.M()` resolves to the enclosing class and `[Type]::M()` to a single unambiguous local class, fixing a same-name-method mis-bind; value, cast, dynamic, duplicate, and external receivers stay fail-closed (#4163, #4158, thanks @oleksii-tumanov).
+- Fix: **C++** classes behind module export macros (`class MYLIB_EXPORT Foo : Base {}`) are preserved — the ALL-CAPS macro is blanked before parsing (byte-length and newline preserving) so tree-sitter no longer error-recovers over the class and drops it (#3661, #3648, thanks @nikhilsaxena04).
+- Fix: incremental `graphify update` keeps placeholder nodes for never-scanned referenced files, so an unchanged referrer's cross-file edges to an unresolved import or a `.csproj`/`.sln` reference are no longer dropped as if the target were deleted; genuinely deleted files are still reaped (#4161, #4160, thanks @rohit-jsfreaky).
+- Fix: `graph_diff` keeps edge direction, so a reversed edge (a→b becomes b→a) is reported as a change instead of cancelling out to "no changes"; the diff now loads the previous graph through the direction-preserving reader (#4170, #4067, thanks @Mpasha17).
+- Perf: the watch reconcile pass computes each stored source path's identity once per update instead of recomputing it for every node, edge, and hyperedge, cutting reconcile on graphify's own repo from 10.2s to 2.7s with graph.json byte-identical (#4151, #4150, thanks @rohit-jsfreaky).
+- Feature: `graph.json` now carries `schema_version` and `graphify_version` metadata for downstream consumers, written additively so existing readers and older graphs are unaffected (#4167, #3638, thanks @smngvlkz).
+
 ## 0.9.77 (2026-10-05)
 
 More community language-structure coverage, two reload/incremental correctness fixes, and a batch of extractor tests.
