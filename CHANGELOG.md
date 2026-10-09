@@ -2,6 +2,12 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.82 (2026-10-09)
+
+- Feature: after `graphify extract` builds a graph, the CLI prints a short one-time pointer to Graphify Cloud (faster indexing, fewer tokens, cross-repo search, PR review, and an always-current view of your SDLC at app.graphify.com). It is shown only in an interactive terminal, once per project, and can be turned off with `GRAPHIFY_NO_TIPS` or `GRAPHIFY_NO_CTA`; CI, piped output, and the AI-assistant pipeline never see it.
+- Fix: **Rust** an in-file call now binds to the type that actually names it rather than any same-named function — `Type::new()` / `Self::f()` / `self.f()` resolve through the owning `impl` (unique-owner only, fail-closed), instead of mis-binding to an unrelated `fn` with the same last segment (#4238, #4237, thanks @rohit-jsfreaky).
+- Fix: **SVG export** strips XML-illegal control characters from node and legend labels, so a label carrying e.g. an ANSI escape no longer produces a malformed `graph.svg`; valid whitespace and Unicode are preserved, and node identity is unchanged (#4244, thanks @Yyunozor).
+
 ## 0.9.81 (2026-10-08)
 
 A large resolution-accuracy and determinism batch across Python, TypeScript, C#, Elixir, and PHP, plus analysis-quality fixes and a portability regression guard.
