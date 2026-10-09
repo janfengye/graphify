@@ -2,6 +2,21 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.83 (2026-10-09)
+
+A C# resolution and determinism batch, plus Windows test-suite fixes.
+
+- Fix: **C#** a generic and a non-generic type of the same name (`Effect` vs `Effect<T>`) now get distinct node ids (arity folded into the id), so they no longer collapse into one node and `Effect<T> : Effect` no longer produces an inherits self-loop (#4255, #4249, thanks @ayushcodes10).
+- Fix: **C#** a call through a member chain (`a.b.C()`), element access (`xs[i].M()`), or inside a constructor body now resolves to the right method, fail-closed to a single declared type per hop (collection element types only for `T[]`/`List<T>`), instead of being dropped (#4258, #4246, thanks @Mpasha17).
+- Fix: **C#** a bare call whose name matches an enum member (`Delegate(t)` next to a `Delegate` case) no longer binds to the enum member; case members are excluded from both the per-file and cross-file call-resolution maps, fail-closed (#4254, #4245, thanks @ayushcodes10).
+- Fix: **C#** a static factory that constructs its own type keeps its `method` membership edge — an undirected collapse previously let the reverse `calls` edge overwrite it, hiding the member from every type walk (#4256, #4248, thanks @Mpasha17).
+- Fix: an unqualified call in **Java/C#/Scala/C++** binds to the method on the caller's own class chain (own class, then in-file bases, then enclosing classes) instead of the last same-named method declared anywhere in the file; fail-closed on a tie, with free functions and constructors still resolving (#4252, thanks @Yyunozor).
+- Fix: an unresolved re-export target id is now portable — it is minted in a dedicated namespace with a hash over the repo-relative path instead of the absolute checkout path, so a clone produces the same graph (#4257, thanks @andan0).
+- Fix: `graphify`'s own skill runbook now reuses the persisted scan options (excludes and the gitignore flag) a prior build wrote, so a skill-driven update no longer drops opted-in files or re-adds explicitly excluded ones versus a CLI rebuild (#4250, #4240, thanks @deepanshupal).
+- Fix: the test suite passes on Windows — `_atomic_replace` refuses a read-only destination there instead of silently clobbering it (nt-only guard, no POSIX change), plus encoding, path-shape, and non-regular-file test guards (#4260, thanks @SoloDrex52).
+- Fix: **C#** nested types imported with `using static` now resolve (`using static Demo.Layer;` reaching `Layer.Inner`), fail-closed on ambiguity, complementing the enclosing-namespace resolution also in this release (#4235, #4216, thanks @hopstreax).
+- Fix: the AST cache directory is now namespaced by the installed tree-sitter grammar versions (`...-g<fingerprint>`), so upgrading a grammar within the same graphify release no longer serves stale or ABI-incompatible cached ASTs for unchanged files (#4239, #4236, thanks @nothariharan).
+
 ## 0.9.82 (2026-10-09)
 
 - Feature: after `graphify extract` builds a graph, the CLI prints a short one-time pointer to Graphify Cloud (faster indexing, fewer tokens, cross-repo search, PR review, and an always-current view of your SDLC at app.graphify.com). It is shown only in an interactive terminal, once per project, and can be turned off with `GRAPHIFY_NO_TIPS` or `GRAPHIFY_NO_CTA`; CI, piped output, and the AI-assistant pipeline never see it.
