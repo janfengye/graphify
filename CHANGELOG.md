@@ -2,6 +2,29 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.85 (2026-10-10)
+
+A language-extraction and tooling batch: six extractor/exporter fixes picked from open issues, plus fourteen community pull requests.
+
+- Fix: **Julia** functions with a `where` clause (long and short form) and parametric type definitions (`struct Box{T}`, `abstract type Shape{T}`, `struct Sq{T} <: Shape{T}`) are now extracted. The name sat inside a `where_expression` / `parametrized_type_expression` wrapper that the name lookup skipped, so the whole method/type was dropped; a declared type parameter (`value::T`) no longer leaks as a phantom field-type node (#4126, #4128).
+- Fix: **Fortran** a named generic `interface` now gets a callable node and a `dispatches_to` edge to each listed `module procedure`, so a call to the generic name resolves instead of dangling; unnamed and operator/assignment interfaces are unaffected (#4141, #4142, thanks @rajatnagda45).
+- Fix: **Elixir** `defdelegate` is now extracted as a function definition, so the delegated function appears and same-module calls to it resolve (#4132).
+- Fix: **Scala 3** `given ... with` instance methods are scoped to the given instead of leaking to file scope (where they collided with the same-named trait type); an anonymous `given Show[Int] with` keeps its members under a synthesized name (#4130).
+- Fix: **graph.html** a node label containing an unclosed `<!--` then `<script` can no longer break out of the embedded data script and blank the page; every `<` in the embedded JSON is escaped (#4124).
+- Fix: the incomplete-extraction message now explains a pure semantic omission (a smaller `--token-budget` is the lever) instead of always blaming truncation (#4101, #4280, thanks @ayushcodes10).
+- Fix: **TypeScript** `export type *` star re-exports no longer trip a spurious syntax-error flag that skewed the health report (#3942, #4303, thanks @ayushcodes10).
+- Fix: **Rust** a cross-file reference to a type with impl blocks in other files now binds to the single declaration instead of a sourceless stub, fail-closed (#4283, #4284, thanks @Alin1233).
+- Fix: distinct files that mint the same node id after the extension is dropped (`x.py` vs `x.html`) are kept as separate nodes instead of collapsing and losing one (#4281, #4282, thanks @bitwizard25).
+- Fix: the git hook now updates the graph for files whose names contain non-ASCII characters (`core.quotePath=false` plus C-quote decoding) (#4278, #4279, thanks @smngvlkz).
+- Fix: **watch** the rebuild lock no longer unlinks on release while a waiter holds it, closing a race that let two rebuilds run at once (POSIX) (#4273, #4277, thanks @ayushcodes10).
+- Fix: an unanchored ignore pattern is now matched against the entry name only (so `*` no longer crosses `/` and negations behave like git) (#4242, #4251, thanks @Yyunozor).
+- Fix: the hook-guard Read nudge now fires for PowerShell source files (`.ps1`/`.psm1`/`.psd1`) (#4271, #4272, thanks @rtmalikian).
+- Fix: the skill now tells you that `graphify-out/` was written into your working tree, with how to gitignore or share it (#3941, #4308, thanks @eoinforker).
+- Fix: `graphify affected <Symbol>` now reaches callers through the symbol's defining file, so Dart/Flutter (and other file-module languages) return results instead of nothing (#4288, #4290, thanks @dcaldr).
+- Fix: an `export default` with a huge base64 literal plus a tsconfig `baseUrl` no longer crashes extraction with "File name too long" (#4166, #4169, thanks @bastiennoel93).
+- Fix: markdown links to a file name containing a space (`[x](<My Note.md>)`, `[x](My%20Note.md)`) now resolve to a references edge (#4177, #4178, thanks @Yyunozor).
+- Perf: skip a per-call `os.getcwd()` in the path-memo key for absolute paths, and walk each JS/TS tree once when collecting symbol facts — both output-identical (#4301, #4302, thanks @pishuv).
+
 ## 0.9.84 (2026-10-10)
 
 A correctness batch picked directly from open issues, plus an OpenCode plugin fix.
@@ -13,6 +36,7 @@ A correctness batch picked directly from open issues, plus an OpenCode plugin fi
 - Fix: **Python** a bare `import logging` is no longer captured by a loose same-named module (`scripts/logging.py`) in a non-package directory — it resolves to the stdlib module. Guarded by a vendored, deterministic stdlib-name set across the module resolver, the sibling-repoint pass, and the build-time stem-alias index; a deliberate package shadow (`logging/__init__.py`) still resolves (#4261).
 - Fix: **Python** a qualified external annotation (`httpx.Response`) no longer binds to an unrelated private local class (`_Response`). The stub-rewire match key now preserves underscores, so `_Response` and `Response` are distinct identifiers (#4269).
 - Fix: **C#** an external type the corpus references but never declares (`List<T>`, `System.Type`, Unity's `VisualElement`) now gets one shared, name-keyed placeholder instead of a separate per-file stub (`a_cs_list`, `b_cs_list`), so a query returns one node and the files sharing the type connect through it (#4247).
+- Fix: two files that differ only by extension (`portal.py` / `portal.html`) no longer collapse into one node. They derive the same extension-stripped id; the best-ranked file keeps it, the other gets an extension-qualified id (`…_portal_html`), and its edges follow it (matched by root-relative `source_file`, so absolute semantic paths work). A bare id shared across different paths still collapses with the warning (#4281).
 - Internal: added regression coverage locking in cross-module binding of a singly-defined type through re-export chains and the unique-stub rewire; the reported failure (#4262) no longer reproduces on this line.
 
 ## 0.9.83 (2026-10-09)
