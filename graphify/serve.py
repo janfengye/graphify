@@ -41,53 +41,60 @@ class ToolError(Exception):
     """
 
 
+def _read_graph(graph_path: str) -> nx.Graph:
+    """Load graph.json exactly as the MCP server does, raising on a bad path
+    or file (ValueError, FileNotFoundError, json.JSONDecodeError) so a library
+    caller such as the benchmark can handle it."""
+    resolved = Path(graph_path).resolve()
+    if resolved.suffix != ".json":
+        raise ValueError(f"Graph path must be a .json file, got: {graph_path!r}")
+    if not resolved.exists():
+        raise FileNotFoundError(f"Graph file not found: {resolved}")
+    check_graph_file_size_cap(resolved)
+    safe = resolved
+    data = json.loads(safe.read_text(encoding="utf-8"))
+    if "links" not in data and "edges" in data:
+        data = dict(data, links=data["edges"])
+    # Stash the on-disk logical flag before the load-time override below:
+    # `directed: True` exists only so renderers can recover stored arc
+    # order (#2309); tools that care about logical direction (#2487) must
+    # not mistake the override for graph truth.
+    _logical_directed = bool(data.get("directed", False))
+    data = {**data, "directed": True}
+    try:
+        from graphify.build import graph_has_legacy_ids as _legacy
+        if _legacy(data.get("nodes", [])):
+            print(
+                "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
+                "rebuild with `graphify extract --force` for path-qualified IDs.",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+    try:
+        G = json_graph.node_link_graph(data, edges="links")
+    except TypeError:
+        G = json_graph.node_link_graph(data)
+    G.graph["_logical_directed"] = _logical_directed
+    # node_link_graph drops top-level keys other than data["graph"], so the
+    # build commit export.to_json writes there is stashed by hand (#3354).
+    _commit = data.get("built_at_commit")
+    if isinstance(_commit, str) and _commit.strip():
+        G.graph["_built_at_commit"] = _commit.strip()
+    # Attach the work-memory overlay (derived sidecar next to graph.json) so
+    # the query/MCP read surface can annotate NODE lines display-only. Empty
+    # when no sidecar exists, leaving un-annotated output byte-identical.
+    try:
+        from graphify.reflect import load_learning_overlay as _llo
+        G.graph["_learning_overlay"] = _llo(resolved)
+    except Exception:
+        G.graph["_learning_overlay"] = {}
+    return G
+
+
 def _load_graph(graph_path: str) -> nx.Graph:
     try:
-        resolved = Path(graph_path).resolve()
-        if resolved.suffix != ".json":
-            raise ValueError(f"Graph path must be a .json file, got: {graph_path!r}")
-        if not resolved.exists():
-            raise FileNotFoundError(f"Graph file not found: {resolved}")
-        check_graph_file_size_cap(resolved)
-        safe = resolved
-        data = json.loads(safe.read_text(encoding="utf-8"))
-        if "links" not in data and "edges" in data:
-            data = dict(data, links=data["edges"])
-        # Stash the on-disk logical flag before the load-time override below:
-        # `directed: True` exists only so renderers can recover stored arc
-        # order (#2309); tools that care about logical direction (#2487) must
-        # not mistake the override for graph truth.
-        _logical_directed = bool(data.get("directed", False))
-        data = {**data, "directed": True}
-        try:
-            from graphify.build import graph_has_legacy_ids as _legacy
-            if _legacy(data.get("nodes", [])):
-                print(
-                    "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
-                    "rebuild with `graphify extract --force` for path-qualified IDs.",
-                    file=sys.stderr,
-                )
-        except Exception:
-            pass
-        try:
-            G = json_graph.node_link_graph(data, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(data)
-        G.graph["_logical_directed"] = _logical_directed
-        # node_link_graph drops top-level keys other than data["graph"], so the
-        # build commit export.to_json writes there is stashed by hand (#3354).
-        _commit = data.get("built_at_commit")
-        if isinstance(_commit, str) and _commit.strip():
-            G.graph["_built_at_commit"] = _commit.strip()
-        # Attach the work-memory overlay (derived sidecar next to graph.json) so
-        # the query/MCP read surface can annotate NODE lines display-only. Empty
-        # when no sidecar exists, leaving un-annotated output byte-identical.
-        try:
-            from graphify.reflect import load_learning_overlay as _llo
-            G.graph["_learning_overlay"] = _llo(resolved)
-        except Exception:
-            G.graph["_learning_overlay"] = {}
-        return G
+        return _read_graph(graph_path)
     except json.JSONDecodeError as exc:
         print(f"error: graph.json is corrupted ({exc}). Re-run /graphify to rebuild.", file=sys.stderr)
         sys.exit(1)
@@ -543,6 +550,8 @@ class _QueryScores(NamedTuple):
     """
     ranked: list[tuple[float, str]]
     best_seed_by_term: dict[str, str]
+    # Terms of `best_seed_by_term`, strongest per-term match first (see `_pick_seeds`).
+    term_order: tuple[str, ...] = ()
 
 
 def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
@@ -734,9 +743,14 @@ def _score_query(
     # match beats a longer superset that happens to share the same score.
     scored.sort(key=lambda s: (-s[0], len(G.nodes[s[1]].get("label") or s[1]), s[1]))
     best_seed_by_term: dict[str, str] = {}
+    term_order: tuple[str, ...] = ()
     if collect_per_term_seeds and best_by_term:
         best_seed_by_term = {t: nid for t, (_key, nid) in best_by_term.items()}
-    return _QueryScores(ranked=scored, best_seed_by_term=best_seed_by_term)
+        # Strongest per-term winner first: the key is (-singleton score, -degree, label length, node id), and the
+        # singleton score already carries the term's IDF weight, so a specific term's exact match leads and a
+        # common term's substring hit trails. The term itself breaks remaining ties, so the order is deterministic.
+        term_order = tuple(t for t, _ in sorted(best_by_term.items(), key=lambda kv: (kv[1][0], kv[0])))
+    return _QueryScores(ranked=scored, best_seed_by_term=best_seed_by_term, term_order=term_order)
 
 
 def _pick_scored_endpoint(G: nx.Graph, scored: list[tuple[float, str]], query: str) -> str:
@@ -770,6 +784,7 @@ def _pick_seeds(
     *,
     G: "nx.Graph | None" = None,
     best_seed_by_term: dict[str, str] | None = None,
+    term_order: "tuple[str, ...] | list[str] | None" = None,
 ) -> list[str]:
     """Select BFS seed nodes, stopping when score drops too far below the top.
 
@@ -844,7 +859,12 @@ def _pick_seeds(
         # The per-label dedup cap also gates these additions, so the guarantee
         # cannot reintroduce a second copy of an already-seeded generic label
         # (#1766).
-        for term in sorted(best_seed_by_term):
+        # With `term_order` (from `_score_query`), the guaranteed seeds follow the strength of each term's best
+        # match, strongest first, so the seeds the renderer prints first are the strongest; without it, the
+        # legacy sorted-term order.
+        ordered_terms = [t for t in (term_order or ()) if t in best_seed_by_term]
+        ordered_terms += sorted(t for t in best_seed_by_term if t not in set(ordered_terms))
+        for term in ordered_terms:
             best_nid = best_seed_by_term[term]
             # Honor the same per-label cap so the per-term guarantee can't
             # reintroduce a second copy of an already-seeded generic label.
@@ -1410,7 +1430,7 @@ def _query_graph_text(
         best_seed_by_term = {
             t: nid for t, nid in best_seed_by_term.items() if t not in intent
         }
-    start_nodes = _pick_seeds(qs.ranked, G=G, best_seed_by_term=best_seed_by_term)
+    start_nodes = _pick_seeds(qs.ranked, G=G, best_seed_by_term=best_seed_by_term, term_order=qs.term_order)
     if not start_nodes:
         return _QUERY_NO_MATCH
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
