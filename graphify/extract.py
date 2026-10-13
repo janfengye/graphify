@@ -1112,7 +1112,7 @@ def _import_c(node, source: bytes, file_nid: str, stem: str, edges: list, str_pa
             module_name = raw.split("/")[-1].split(".")[0]
             if module_name:
                 tgt_nid = _make_id(module_name)
-                edges.append({
+                edge_dict = {
                     "source": file_nid,
                     "target": tgt_nid,
                     "relation": "imports",
@@ -1121,7 +1121,13 @@ def _import_c(node, source: bytes, file_nid: str, stem: str, edges: list, str_pa
                     "source_file": str_path,
                     "source_location": f"L{node.start_point[0] + 1}",
                     "weight": 1.0,
-                })
+                }
+                if child.type != "system_lib_string":
+                    edge_dict["metadata"] = sanitize_metadata({
+                        "raw_include": raw,
+                        "include_kind": "quoted",
+                    })
+                edges.append(edge_dict)
             break
 
 
@@ -2270,7 +2276,7 @@ def _rescue_js_dynamic_imports(path: Path, result: dict) -> None:
             resolution = _resolve_rescued_specifier(path, raw, aliases, base_url)
             if resolution is None:
                 continue
-            node_id, _stub_sf, resolved_file = resolution
+            node_id, _stub_sf, resolved_file, _is_external = resolution
             # AST-captured already: same resolved target id, same resolved
             # on-disk file, or the engine's ref-namespaced external id.
             if node_id in deferred_ids or _make_id("ref", raw) in deferred_ids:
@@ -2412,10 +2418,10 @@ def _resolve_rescued_specifier(
     raw: str,
     aliases,
     base_url,
-) -> "tuple[str, str, Path | None] | None":
+) -> "tuple[str, str, Path | None, bool] | None":
     """Resolve a regex-rescued import specifier the way ``_import_js`` does.
 
-    Returns ``(node_id, stub_source_file, resolved_file)`` — ``resolved_file``
+    Returns ``(node_id, stub_source_file, resolved_file, is_external)`` — ``resolved_file``
     is the target as a real on-disk file, or None when the specifier is
     external or dangling. Returns None when no target can be minted at all
     (empty bare-import segment). Split out of :func:`_emit_rescued_import` so
@@ -2428,7 +2434,7 @@ def _resolve_rescued_specifier(
             Path(os.path.normpath(path.parent / raw))
         )
         resolved_file = resolved if resolved is not None and resolved.is_file() else None
-        return _make_id(str(resolved)), str(resolved), resolved_file
+        return _make_id(str(resolved)), str(resolved), resolved_file, False
     # Check tsconfig.json path aliases (e.g. "$lib/" -> "src/lib/",
     # "@/" -> "src/") before treating as external. Mirrors _import_js
     # logic so alias imports resolve to the same file node IDs the
@@ -2438,18 +2444,20 @@ def _resolve_rescued_specifier(
         resolved_alias = _resolve_js_module_path(resolved_alias)
         resolved_file = (resolved_alias if resolved_alias is not None
                          and resolved_alias.is_file() else None)
-        return _make_id(str(resolved_alias)), str(resolved_alias), resolved_file
+        return _make_id(str(resolved_alias)), str(resolved_alias), resolved_file, False
     # Unmapped `@/` project-root convention fallback (#3357).
     if raw.startswith("@/"):
         resolved_unmapped = _resolve_js_module_path(raw, path.parent)
         if resolved_unmapped is not None and resolved_unmapped.is_file():
-            return _make_id(str(resolved_unmapped)), str(resolved_unmapped), resolved_unmapped
-    # Bare/scoped import (node_modules) - use last segment;
-    # build_from_json drops as external if no matching node exists.
-    module_name = raw.split("/")[-1]
+            return _make_id(str(resolved_unmapped)), str(resolved_unmapped), resolved_unmapped, False
+    # Bare/scoped import (node_modules) - anchor to the PACKAGE, not the path
+    # leaf: `lodash/fp/map` is a dependency on `lodash`, and `@a/utils` and
+    # `@b/utils` are different packages that share a leaf.
+    parts = raw.split("/")
+    module_name = "/".join(parts[:2]) if raw.startswith("@") and len(parts) >= 2 else parts[0]
     if not module_name:
         return None
-    return _make_id(module_name), raw, None
+    return _make_id(module_name), module_name, None, True
 
 
 def _emit_rescued_import(
@@ -2482,7 +2490,7 @@ def _emit_rescued_import(
     resolution = _resolve_rescued_specifier(path, raw, aliases, base_url)
     if resolution is None:
         return
-    node_id, stub_source_file, resolved_file = resolution
+    node_id, stub_source_file, resolved_file, is_external = resolution
     edge = {
         "source": file_node_id, "target": node_id,
         "relation": relation, "confidence": "EXTRACTED",
@@ -2498,11 +2506,28 @@ def _emit_rescued_import(
         # Edge target already a real node - just add the edge, don't add a node.
         result.setdefault("edges", []).append(edge)
         return
-    result.setdefault("nodes", []).append({
+    stub: dict = {
         "id": node_id, "label": raw,
         "file_type": "code", "source_file": stub_source_file,
         "confidence": "EXTRACTED",
-    })
+    }
+    if is_external:
+        # A bare/scoped specifier names a MODULE, not a path: the same package
+        # imported from N files is one node, and it is the same package a
+        # manifest in the corpus declares under that name. Mark it the way Swift
+        # module anchors are marked (#1327) — `file_type=code` keeps build.py
+        # validation happy, `type=module` exempts it from id-disambiguation — so
+        # it collapses with that declaration instead of being salted apart from
+        # it. Without this the salt renames the node and every importing edge is
+        # left on the dead id, so a declared dependency silently loses all of its
+        # inbound edges while an undeclared one keeps them (#3084).
+        stub["type"] = "module"
+        # For an external, `stub_source_file` is the package name (see
+        # _resolve_rescued_specifier) — and the node IS that package, so name it
+        # that way. `lodash/fp/map` and `lodash/debounce` are one `lodash` node,
+        # and neither subpath should end up titling it.
+        stub["label"] = stub_source_file
+    result.setdefault("nodes", []).append(stub)
     result.setdefault("edges", []).append(edge)
     existing_ids.add(node_id)
 
@@ -2728,6 +2753,176 @@ def extract_astro(path: Path) -> dict:
                 _emit_rescued_import(
                     result, existing_ids, file_node_id, path, raw,
                     "imports_from", aliases, base_url,
+                )
+    except Exception:
+        pass
+    return result
+
+
+# EJS spells a tag `<%` (code), `<%_` (code, whitespace-slurp), `<%=`/`<%-`
+# (escaped/unescaped output) or `<%#` (comment); `<%%` is an escaped literal
+# `<%`. Only the code bodies and inline `<script>` bodies are JS statements a
+# grammar can read — markup and output expressions are not, so a `.ejs` file fed
+# whole to the JS grammar is one top-level ERROR that loses every symbol (the
+# `.svelte` lesson of #3928).
+_EJS_SCRIPT_TAG_RE = _HTML_SCRIPT_TAG_RE
+_EJS_INCLUDE_RE = re.compile(
+    r"""<%(?:_|[-=])?\s*include\s*\(\s*['"]([^'"]+)['"]"""
+)
+
+
+def _ejs_mask_non_script(src: str) -> str:
+    """Blank an EJS template down to the JavaScript a parser can read.
+
+    Keeps the bodies of code tags (``<% %>`` / ``<%_ %>``) and of JS ``<script>``
+    blocks; markup, ``<%# %>`` comments and ``<%= %>``/``<%- %>`` output
+    expressions become spaces, with ``\\r``/``\\n`` preserved so AST line
+    numbers and byte offsets still match the original file. An output tag inside
+    a ``<script>`` body is replaced by a length-preserving ``0`` so the
+    surrounding statement still parses (``const x = <%- data %>;``).
+    """
+    n = len(src)
+    keep = bytearray(n)        # 1 where the character is JS we want to parse
+    neutralize = bytearray(n)  # 1 inside an output tag that sits in kept JS
+
+    for m in _EJS_SCRIPT_TAG_RE.finditer(src):
+        if _NON_JS_SCRIPT_TYPE_RE.search(m.group(1)):
+            continue
+        for p in range(m.start(2), m.end(2)):
+            keep[p] = 1
+
+    i = 0
+    while True:
+        j = src.find("<%", i)
+        if j < 0:
+            break
+        if j + 2 < n and src[j + 2] == "%":  # `<%%` — a literal `<%`
+            for p in range(j, min(j + 3, n)):
+                keep[p] = 0
+            i = j + 3
+            continue
+        marker = src[j + 2] if j + 2 < n else ""
+        close = src.find("%>", j + 2)
+        if close < 0:
+            break
+        # The `<%` … `%>` delimiters are never JS, even inside a <script> body.
+        for p in (j, j + 1, close, close + 1):
+            if p < n:
+                keep[p] = 0
+        if marker in ("=", "-"):
+            for p in range(j + 2, close):
+                if keep[p]:
+                    neutralize[p] = 1
+        elif marker == "#":
+            for p in range(j, close + 2):
+                keep[p] = 0
+        else:
+            # Code tag (`<%` or `<%_`): its body is real JS.
+            body_start = j + 3 if marker == "_" else j + 2
+            if marker == "_":
+                keep[j + 2] = 0  # the `<%_` whitespace-slurp modifier
+            for p in range(body_start, close):
+                keep[p] = 1
+        i = close + 2
+
+    out: list[str] = []
+    in_output = False
+    for p in range(n):
+        c = src[p]
+        if c in "\r\n":
+            out.append(c)
+            in_output = False
+        elif not keep[p]:
+            out.append(" ")
+            in_output = False
+        elif neutralize[p]:
+            out.append(" " if in_output else "0")
+            in_output = True
+        else:
+            out.append(c)
+            in_output = False
+    return "".join(out)
+
+
+def _emit_ejs_include(
+    result: dict,
+    existing_ids: set,
+    file_node_id: str,
+    path: Path,
+    raw: str,
+    line: int,
+) -> None:
+    """Emit the template-composition edge for ``<%- include('partial') %>``.
+
+    EJS resolves an include relative to the including template, so probe the
+    template's own directory through :func:`_resolve_js_import_path` — which,
+    now that ``.ejs`` is a JS resolve extension, appends ``.ejs``/``index.ejs``
+    the way EJS itself does. A relative hit is stamped with ``target_file`` so
+    the #2169 canonicalization pass repoints it at the real template node; a
+    bare/views-root include that cannot be resolved keeps a stub node, so the
+    edge is never dropped.
+    """
+    base = Path(os.path.normpath(path.parent / raw))
+    resolved = _resolve_js_import_path(base)
+    edge = {
+        "source": file_node_id, "relation": "includes", "confidence": "EXTRACTED",
+        "source_file": str(path), "source_location": f"L{line}",
+    }
+    if resolved.is_file():
+        edge["target"] = _make_id(str(resolved))
+        edge["target_file"] = str(resolved)
+        result.setdefault("edges", []).append(edge)
+        return
+    node_id = _make_id(raw)
+    if node_id not in existing_ids:
+        existing_ids.add(node_id)
+        result.setdefault("nodes", []).append({
+            "id": node_id, "label": raw, "file_type": "code",
+            "source_file": str(path), "source_location": f"L{line}",
+            "confidence": "EXTRACTED",
+        })
+    edge["target"] = node_id
+    result.setdefault("edges", []).append(edge)
+
+
+def extract_ejs(path: Path) -> dict:
+    """Extract imports, symbols, and `include()` composition from an EJS template.
+
+    EJS is HTML carrying ``<% %>`` scriptlets and inline ``<script>`` blocks, so
+    the whole file is not JS: fed to the JS grammar it becomes a top-level ERROR
+    and every symbol inside a scriptlet is lost (``_ejs_mask_non_script`` keeps
+    only the JS regions, preserving line numbers). The AST pass then reads the
+    template's real JavaScript — ``require``/``import`` edges, functions,
+    classes — and two regex passes add what no JS grammar can see: dynamic
+    ``import('./X')`` calls written in a scriptlet, and the EJS
+    ``<%- include('partial') %>`` composition edge an Express view graph is
+    built on (#3811, #2511).
+    """
+    try:
+        src = _read_source_text(path)
+    except OSError as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    masked = _ejs_mask_non_script(src).encode("utf-8")
+    masked = _normalize_ts_import_types(masked) or masked
+    result = _extract_generic(path, _TS_CONFIG, source_override=masked)
+
+    try:
+        existing_ids = {n["id"] for n in result.get("nodes", [])}
+        file_node_id = _make_id(str(path))
+        aliases = _load_tsconfig_aliases(path.parent)
+        base_url = _load_tsconfig_base_url(path.parent)
+        for m in re.finditer(r"""import\(\s*['"]([^'"]+)['"]\s*\)""", src):
+            if m.group(1):
+                _emit_rescued_import(
+                    result, existing_ids, file_node_id, path, m.group(1),
+                    "dynamic_import", aliases, base_url,
+                )
+        for m in _EJS_INCLUDE_RE.finditer(src):
+            if m.group(1):
+                _emit_ejs_include(
+                    result, existing_ids, file_node_id, path, m.group(1),
+                    src.count("\n", 0, m.start()) + 1,
                 )
     except Exception:
         pass
@@ -3167,9 +3362,167 @@ def extract_ruby(path: Path) -> dict:
     return _extract_generic(path, _RUBY_CONFIG)
 
 
+def _csharp_string_opener(source: bytes, i: int) -> "tuple[int, int, bool, bool]":
+    """Read a possible string-literal opener at ``i``.
+
+    Returns ``(prefix_end, quote_run, interpolated, verbatim)``. ``quote_run`` is
+    0 when no string starts here, and ``prefix_end`` is always where the run of
+    ``$``/``@`` characters stopped — the caller needs that even on a miss, so it
+    can resume past the run instead of re-walking it from the next byte (a long
+    run in malformed source would otherwise cost O(n^2)).
+
+    C# lets the ``$`` and ``@`` prefixes appear in either order and repeat, and
+    a raw string literal opens with a run of three or more quotes, so the prefix
+    is read as a set of flags rather than matched as fixed spellings.
+    """
+    j = i
+    interpolated = False
+    verbatim = False
+    while j < len(source):
+        ch = source[j:j + 1]
+        if ch == b"$":
+            interpolated = True
+        elif ch == b"@":
+            verbatim = True
+        else:
+            break
+        j += 1
+    if source[j:j + 1] != b'"':
+        return j, 0, interpolated, verbatim
+    run = 0
+    while source[j + run:j + run + 1] == b'"':
+        run += 1
+    return j, run, interpolated, verbatim
+
+
+def _csharp_broken_escape_offsets(source: bytes) -> list[int]:
+    """Offsets of the ``""`` pairs that trigger the #3376 grammar bug.
+
+    A verbatim interpolated string whose text ends with an interpolation hole,
+    then an escaped quote, then the terminator — the ``}`` ``""`` ``"``
+    adjacency — is rejected by tree-sitter-c-sharp 0.23.5 even though it is
+    valid C#. Every neighbouring spelling parses, so only that adjacency is
+    reported here.
+
+    The file is walked once so a ``$@"`` written inside a comment, a char
+    literal or another string is never mistaken for code.
+    """
+    offsets: list[int] = []
+    n = len(source)
+    i = 0
+    while i < n:
+        if source.startswith(b"//", i):
+            nl = source.find(b"\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if source.startswith(b"/*", i):
+            end = source.find(b"*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        if source[i:i + 1] == b"'":
+            j = i + 1
+            while j < n:
+                if source[j:j + 1] == b"\\":
+                    j += 2
+                    continue
+                if source[j:j + 1] in (b"'", b"\n"):
+                    break
+                j += 1
+            i = j + 1
+            continue
+        quote, run, interpolated, verbatim = _csharp_string_opener(source, i)
+        if run == 0:
+            # No string opens here. Resume at the end of the `$`/`@` run rather
+            # than at i + 1: re-walking a long run from every offset is what
+            # makes a malformed file quadratic.
+            i = quote if quote > i else i + 1
+            continue
+        if run >= 3:
+            # Raw string literal: closed by a quote run of the same length.
+            end = source.find(b'"' * run, quote + run)
+            i = n if end == -1 else end + run
+            continue
+        if run == 2:
+            i = quote + 2  # empty string literal
+            continue
+        j = quote + 1
+        if verbatim:
+            # `""` is the escape; a verbatim string may span lines.
+            while j < n:
+                if source.startswith(b'""', j):
+                    j += 2
+                    continue
+                if source[j:j + 1] == b'"':
+                    break
+                j += 1
+            if j < n and interpolated and j - 2 > quote and source[j - 2:j] == b'""' and source[j - 3:j - 2] == b"}":
+                offsets.append(j - 2)
+        else:
+            while j < n:
+                ch = source[j:j + 1]
+                if ch == b"\\":
+                    j += 2
+                    continue
+                if ch in (b'"', b"\n"):
+                    break
+                j += 1
+        i = j + 1
+    return offsets
+
+
+def _normalize_csharp_verbatim_interpolation(source: bytes) -> bytes | None:
+    """Neutralize the one verbatim-interpolated spelling the C# grammar rejects, or None.
+
+    A verbatim interpolated string whose text ends with an interpolation hole,
+    an escaped quote and then the terminator is valid C# — ``dotnet build``
+    accepts it — but tree-sitter-c-sharp 0.23.5 rejects it, so it is partially
+    extracted and every member after that line is silently missing from the
+    graph. 0.23.5 is the newest release, so there is no grammar bump to take
+    (#3376).
+
+    Only the trailing ``""`` escape is overwritten, with two spaces. The
+    rewrite is **byte-length preserving** — nothing is inserted or deleted and
+    no line break is touched — so every offset, line and column still points at
+    the same place in the file on disk and reported source locations stay
+    accurate (the #2876 contract). The interpolation hole itself is kept, so
+    identifiers referenced inside it still resolve.
+
+    Returns None unless the file genuinely needs it AND the rewrite fixes it:
+    a file that already parses is never touched, and if the masked source still
+    has errors the original is used, leaving today's behaviour exactly as it is.
+    """
+    try:
+        import tree_sitter_c_sharp as ts_c_sharp
+        from tree_sitter import Language, Parser
+
+        parser = Parser(Language(ts_c_sharp.language()))
+    except Exception:
+        return None
+    try:
+        if not parser.parse(source).root_node.has_error:
+            return None
+        offsets = _csharp_broken_escape_offsets(source)
+        if not offsets:
+            return None
+        masked = bytearray(source)
+        for start in offsets:
+            masked[start:start + 2] = b"  "
+        out = bytes(masked)
+        if parser.parse(out).root_node.has_error:
+            return None
+    except Exception:
+        return None
+    return out
+
+
 def extract_csharp(path: Path) -> dict:
     """Extract C# type declarations, methods, namespaces, and usings from a .cs file."""
-    return _extract_generic(path, _CSHARP_CONFIG)
+    source_override = None
+    try:
+        source_override = _normalize_csharp_verbatim_interpolation(path.read_bytes())
+    except OSError:
+        pass
+    return _extract_generic(path, _CSHARP_CONFIG, source_override=source_override)
 
 
 def extract_kotlin(path: Path) -> dict:
@@ -3420,7 +3773,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     # JS/TS module graph (SFCs embed JS/TS)
     ".js": "jsts", ".jsx": "jsts", ".mjs": "jsts", ".cjs": "jsts",
     ".ts": "jsts", ".tsx": "jsts", ".mts": "jsts", ".cts": "jsts",
-    ".vue": "jsts", ".svelte": "jsts", ".astro": "jsts",
+    ".vue": "jsts", ".svelte": "jsts", ".astro": "jsts", ".ejs": "jsts",
     # JVM interop
     ".java": "jvm", ".kt": "jvm", ".kts": "jvm",
     ".scala": "jvm", ".groovy": "jvm", ".gradle": "jvm",
@@ -5449,6 +5802,14 @@ def _resolve_java_member_calls(
     caller's class plus method parameters and explicit locals are inferred from
     the extractor's method-scoped type table. A missing or ambiguous receiver
     type is skipped rather than falling back to a bare method-name match.
+
+    A bare `m()` or `field.m()` the caller's file could not bind names a member
+    the class inherits from a supertype in another file: the nearest supertype
+    declaring it is the target, and a tie on one level binds nothing.
+
+    A receiver that is itself a call (`builder().size(3).build()`), a `new T()`
+    or a cast is typed step by step from the declared return types the
+    extractor put on method nodes (`_java_ret`).
     """
     def key(label: str) -> str:
         return str(label).strip().removeprefix(".").removesuffix("()")
@@ -5485,12 +5846,15 @@ def _resolve_java_member_calls(
     # The per-file tables ride the results keyed by class label + source_file
     # (never node id, see #3150); bind each to its class node, ambiguity skips.
     inherits_bases: dict[str, list[str]] = {}
+    supertypes: dict[str, list[str]] = {}
     for edge in all_edges:
         if edge.get("relation") == "inherits":
             inherits_bases.setdefault(edge["source"], []).append(edge["target"])
+        if edge.get("relation") in ("inherits", "implements"):
+            supertypes.setdefault(edge["source"], []).append(edge["target"])
     class_fields = _bind_member_field_tables(per_file, all_nodes, lang="java")
 
-    def _inherited_field_type(class_nid, field: str):
+    def _inherited_field_type(class_nid, field: str, bases: dict[str, list[str]] = inherits_bases):
         seen: set = set()
         queue = [class_nid]
         while queue:
@@ -5501,8 +5865,58 @@ def _resolve_java_member_calls(
             hit = class_fields.get(cls, {}).get(field)
             if hit:
                 return hit
-            queue.extend(inherits_bases.get(cls, []))
+            queue.extend(bases.get(cls, []))
         return None
+
+    def _inherited_method(class_nid: str, callee_key: str) -> str | None:
+        # Java's "class wins": a method declared up the superclass chain beats
+        # an interface default, whatever the depth. Only then the interfaces,
+        # level by level. The class itself was searched in-file.
+        seen = {class_nid}
+        chain: list[str] = []
+        cls = class_nid
+        while len(parents := [b for b in inherits_bases.get(cls, []) if b not in seen]) == 1:
+            cls = parents[0]
+            seen.add(cls)
+            chain.append(cls)
+        for nid in chain:
+            source_file = node_by_id.get(nid, {}).get("source_file")
+            if source_file and _lang_family(source_file) != "jvm":
+                return None
+            declared = method_index.get((nid, callee_key))
+            if declared:
+                return next(iter(declared)) if len(declared) == 1 else None
+        level = list(dict.fromkeys(
+            base for nid in [class_nid, *chain] for base in supertypes.get(nid, []) if base not in seen
+        ))
+        while level:
+            hits: set[str] = set()
+            for nid in level:
+                seen.add(nid)
+                source_file = node_by_id.get(nid, {}).get("source_file")
+                if source_file and _lang_family(source_file) != "jvm":
+                    return None
+                hits |= method_index.get((nid, callee_key), set())
+            if hits:
+                return next(iter(hits)) if len(hits) == 1 else None
+            level = list(dict.fromkeys(
+                base for nid in level for base in supertypes.get(nid, []) if base not in seen
+            ))
+        return None
+
+    def _emit(caller: str, method_nid: str, raw_call: dict, exact: bool) -> None:
+        existing_pairs.add((caller, method_nid))
+        all_edges.append({
+            "source": caller,
+            "target": method_nid,
+            "relation": "calls",
+            "context": "call",
+            "confidence": "EXTRACTED" if exact else "INFERRED",
+            "confidence_score": 1.0 if exact else 0.85,
+            "source_file": raw_call.get("source_file", ""),
+            "source_location": raw_call.get("source_location"),
+            "weight": 1.0,
+        })
 
     def _jvm_bases(type_nid: str) -> list[str] | None:
         bases = inherits_bases.get(type_nid, [])
@@ -5531,13 +5945,66 @@ def _resolve_java_member_calls(
             frontier.extend(bases)
         return next(iter(hits)) if len(hits) == 1 else None
 
+    def _type_named(name: str, near: str | None) -> str | None:
+        # A name declared more than once (a nested `Builder` in many classes)
+        # is the one in the file that names it, or none.
+        defs = type_def_nids.get(key(name), [])
+        if len(defs) > 1:
+            here = node_by_id.get(near, {}).get("source_file")
+            defs = [nid for nid in defs if node_by_id.get(nid, {}).get("source_file") == here]
+        return defs[0] if len(defs) == 1 else None
+
+    def _chain_type(chain: list, caller: str, depth: int = 0) -> str | None:
+        kind = chain[0] if chain and depth <= 16 else None
+        if kind == "type":
+            return _type_named(chain[1], caller)
+        if kind == "this":
+            return enclosing_type.get(caller)
+        if kind == "super":
+            bases = _jvm_bases(enclosing_type.get(caller, ""))
+            return bases[0] if bases and len(bases) == 1 else None
+        if kind == "call":
+            owner = (enclosing_type.get(caller) if chain[2] is None
+                     else _chain_type(chain[2], caller, depth + 1))
+            method_nid = _method_on_type_or_bases(owner, key(chain[1])) if owner else None
+            returned = node_by_id.get(method_nid or "", {}).get("_java_ret")
+            return _type_named(returned, method_nid) if returned else None
+        return None
+
     for result in per_file:
         for raw_call in result.get("raw_calls", []):
-            if raw_call.get("lang") != "java" or not raw_call.get("is_member_call"):
+            if raw_call.get("lang") != "java":
                 continue
             receiver = raw_call.get("receiver")
             callee = raw_call.get("callee")
             caller = raw_call.get("caller_nid")
+            if not raw_call.get("is_member_call"):
+                class_nid = enclosing_type.get(caller)
+                method_nid = _inherited_method(class_nid, key(callee)) if class_nid and callee else None
+                # `new Base()` names a constructor, which is not inherited.
+                owner = node_by_id.get(enclosing_type.get(method_nid or ""), {})
+                if (method_nid and method_nid != caller and key(owner.get("label", "")) != key(callee)
+                        and (caller, method_nid) not in existing_pairs):
+                    _emit(caller, method_nid, raw_call, True)
+                continue
+            chain = raw_call.get("java_receiver_chain")
+            if chain and not receiver and callee and caller:
+                type_nid = _chain_type(chain, caller)
+                method_nid = _method_on_type_or_bases(type_nid, key(callee)) if type_nid else None
+                if method_nid and method_nid != caller and (caller, method_nid) not in existing_pairs:
+                    existing_pairs.add((caller, method_nid))
+                    all_edges.append({
+                        "source": caller,
+                        "target": method_nid,
+                        "relation": "calls",
+                        "context": "call",
+                        "confidence": "INFERRED",
+                        "confidence_score": 0.85,
+                        "source_file": raw_call.get("source_file", ""),
+                        "source_location": raw_call.get("source_location"),
+                        "weight": 1.0,
+                    })
+                continue
             if not receiver or not callee or not caller:
                 continue
 
@@ -5555,6 +6022,8 @@ def _resolve_java_member_calls(
                 exact = True
             else:
                 type_name = raw_call.get("receiver_type")
+                if not type_name and raw_call.get("receiver_unbound"):
+                    type_name = _inherited_field_type(enclosing_type.get(caller), receiver, supertypes)
                 if not type_name and receiver[:1].isupper():
                     type_name = receiver
                     exact = True
@@ -5583,18 +6052,7 @@ def _resolve_java_member_calls(
             method_nid = _method_on_type_or_bases(type_nid, key(callee))
             if not method_nid or method_nid == caller or (caller, method_nid) in existing_pairs:
                 continue
-            existing_pairs.add((caller, method_nid))
-            all_edges.append({
-                "source": caller,
-                "target": method_nid,
-                "relation": "calls",
-                "context": "call",
-                "confidence": "EXTRACTED" if exact else "INFERRED",
-                "confidence_score": 1.0 if exact else 0.85,
-                "source_file": raw_call.get("source_file", ""),
-                "source_location": raw_call.get("source_location"),
-                "weight": 1.0,
-            })
+            _emit(caller, method_nid, raw_call, exact)
 
 
 def _resolve_objc_member_calls(
@@ -5854,6 +6312,150 @@ def _resolve_kotlin_import_targets(
         candidates = pkg_symbols.get(pkg, {}).get(name, [])
         if len(candidates) == 1:  # single-candidate guard: never fabricate
             e["target"] = candidates[0]
+
+
+_C_FAMILY_HEADER_EXTS = frozenset({".h", ".hpp", ".hh", ".hxx", ".cuh", ".inl"})
+
+
+def _resolve_c_include_edges(
+    edges: list[dict],
+    resolution_nodes: list[dict],
+    root: Path | None = None,
+) -> None:
+    """Resolve unresolved quoted C/C++/ObjC include edges to matching header file nodes (#4354).
+
+    When a quoted #include / #import is outside the including file's directory,
+    _resolve_c_include_path cannot resolve it, so per-file extraction emits a
+    fallback edge targeting a bare stem ID with metadata={"raw_include": ..., "include_kind": "quoted"}.
+    This pass runs after canonical node IDs and collision disambiguation are
+    established, but before import-evidence indexing.
+
+    Resolution rules:
+    1. Only processes unresolved quoted includes (metadata.include_kind == "quoted"
+       and metadata.raw_include is present).
+    2. Explicit relative (./ or ../) or absolute paths that failed sibling
+       resolution are never resolved via corpus fallback.
+    3. Matches the full include path as a path suffix, not merely the basename
+       when the include contains directory components.
+    4. Prefers exact-case matches over case-insensitive matches.
+    5. If no exact-case candidate exists, falls back to case-insensitive matching.
+    6. If multiple candidates remain, uses longest-shared-directory-prefix as a
+       tie-breaker. Resolves only when one candidate has a strictly greater score
+       than all others; ties remain unresolved. This is a heuristic and does not
+       claim to reproduce compiler include-order semantics.
+    7. Resolved edges point to the canonical target file node ID.
+    8. Unresolved edges remain untouched for external stub creation.
+    """
+    if not edges or not resolution_nodes:
+        return
+
+    headers_by_basename: dict[str, list[tuple[dict, str]]] = {}
+    headers_by_basename_ci: dict[str, list[tuple[dict, str]]] = {}
+
+    for n in resolution_nodes:
+        if n.get("type") == "namespace" or n.get("file_type") == "rationale":
+            continue
+        sf = n.get("source_file")
+        if not sf:
+            continue
+        sf_str = str(sf)
+        sf_p = Path(sf_str)
+        if sf_p.suffix.lower() not in _C_FAMILY_HEADER_EXTS:
+            continue
+        if n.get("label") != sf_p.name:
+            continue
+        if not n.get("id"):
+            continue
+
+        sf_key = _source_key(sf_str, root) if root else sf_str
+        cand_path = sf_key.replace("\\", "/").rstrip("/")
+        basename = cand_path.split("/")[-1]
+
+        headers_by_basename.setdefault(basename, []).append((n, cand_path))
+        headers_by_basename_ci.setdefault(basename.lower(), []).append((n, cand_path))
+
+    if not headers_by_basename:
+        return
+
+    def _shared_dir_prefix_len(p1_parts: list[str], p2_parts: list[str]) -> int:
+        score = 0
+        for a, b in zip(p1_parts, p2_parts):
+            if a == b:
+                score += 1
+            else:
+                break
+        return score
+
+    for e in edges:
+        if e.get("relation") != "imports":
+            continue
+        md = e.get("metadata")
+        if not isinstance(md, dict):
+            continue
+        if md.get("include_kind") != "quoted":
+            continue
+        raw = md.get("raw_include")
+        if not raw or not isinstance(raw, str):
+            continue
+
+        raw_norm = raw.replace("\\", "/").strip()
+        if not raw_norm:
+            continue
+
+        if raw_norm.startswith(("./", "../", "/")):
+            continue
+        try:
+            if Path(raw).is_absolute():
+                continue
+        except Exception:
+            pass
+
+        target_base = raw_norm.split("/")[-1]
+        if not target_base:
+            continue
+
+        exact_cands = headers_by_basename.get(target_base, [])
+        matches = [
+            (node, cand_path) for node, cand_path in exact_cands
+            if cand_path == raw_norm or cand_path.endswith("/" + raw_norm)
+        ]
+
+        if not matches:
+            ci_cands = headers_by_basename_ci.get(target_base.lower(), [])
+            raw_norm_lower = raw_norm.lower()
+            matches = [
+                (node, cand_path) for node, cand_path in ci_cands
+                if cand_path.lower() == raw_norm_lower or cand_path.lower().endswith("/" + raw_norm_lower)
+            ]
+
+        if not matches:
+            continue
+
+        winner_node: dict | None = None
+        if len(matches) == 1:
+            winner_node = matches[0][0]
+        else:
+            imp_sf = str(e.get("source_file", ""))
+            imp_key = _source_key(imp_sf, root) if root else imp_sf
+            imp_path = imp_key.replace("\\", "/").rstrip("/")
+            imp_parts = imp_path.split("/")[:-1]
+
+            scored: list[tuple[int, dict]] = []
+            for node, cand_path in matches:
+                cand_parts = cand_path.split("/")[:-1]
+                score = _shared_dir_prefix_len(imp_parts, cand_parts)
+                scored.append((score, node))
+
+            max_score = max(s[0] for s in scored)
+            top_matches = [node for score, node in scored if score == max_score]
+            if len(top_matches) == 1:
+                winner_node = top_matches[0]
+            else:
+                winner_node = None
+
+        if winner_node is not None:
+            e["target"] = winner_node["id"]
+            e.pop("target_file", None)
 
 
 def _resolve_csharp_qualified_calls(
@@ -7653,6 +8255,7 @@ _DISPATCH: dict[str, Any] = {
     ".vue": extract_vue,
     ".svelte": extract_svelte,
     ".astro": extract_astro,
+    ".ejs": extract_ejs,
     ".dart": extract_dart,
     ".ml": extract_ocaml,
     ".mli": extract_ocaml,
@@ -9270,6 +9873,15 @@ def extract(
         paths, per_file, all_nodes, all_edges,
         resolvers=[_KOTLIN_IMPORT_TARGET_RESOLVER],
     )
+
+    # C/C++/ObjC quoted include resolution (#4354): resolve quoted include edges
+    # outside the including file's directory to canonical header file nodes.
+    # Runs after node-ID disambiguation and before import-evidence indexing.
+    try:
+        _resolve_c_include_edges(all_edges, resolution_nodes, root)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("C include resolution failed, skipping: %s", exc)
 
     # Build evidence index from import edges so cross-file calls backed by an
     # explicit import statement can be promoted from INFERRED to EXTRACTED.

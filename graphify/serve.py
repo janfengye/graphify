@@ -1408,7 +1408,31 @@ def _query_graph_text(
     token_budget: int = 2000,
     context_filters: list[str] | None = None,
     graph_path: str | None = None,
+    seeds: list[str] | None = None,
+    seed_root: Path | None = None,
 ) -> str:
+    # Explicit start nodes: an external ranker -- embeddings, a learned
+    # retriever, grep -- can choose where the traversal begins instead of the
+    # question's keyword matches. Each value resolves exactly as `affected`
+    # resolves its seed (node id, unique label, or repo-relative / absolute file
+    # path; `seed_root` anchors absolute paths), so there is one interpretation
+    # of a node reference. Fail closed: a value that does not resolve to exactly
+    # one node is reported and skipped, never guessed.
+    unresolved: list[str] = []
+    if seeds:
+        from graphify.affected import resolve_seed
+        start_nodes: list[str] = []
+        for value in seeds:
+            nid = resolve_seed(G, value, seed_root)
+            if nid is None:
+                if value not in unresolved:
+                    unresolved.append(value)
+            elif nid not in start_nodes:
+                start_nodes.append(nid)
+        if not start_nodes:
+            return "No unique node match for --seed: " + ", ".join(seeds)
+        return _render_query(G, question, start_nodes, mode=mode, depth=depth, token_budget=token_budget,
+                             context_filters=context_filters, graph_path=graph_path, given=True, unresolved=unresolved)
     terms = _query_terms(question)
     # One graph scoring pass produces both the combined ranking (used to drive
     # the gap-based seed selection below) and the per-token singleton winners
@@ -1433,13 +1457,32 @@ def _query_graph_text(
     start_nodes = _pick_seeds(qs.ranked, G=G, best_seed_by_term=best_seed_by_term, term_order=qs.term_order)
     if not start_nodes:
         return _QUERY_NO_MATCH
+    return _render_query(G, question, start_nodes, mode=mode, depth=depth, token_budget=token_budget,
+                         context_filters=context_filters, graph_path=graph_path)
+
+
+def _render_query(
+    G: nx.Graph,
+    question: str,
+    start_nodes: list[str],
+    *,
+    mode: str,
+    depth: int,
+    token_budget: int,
+    context_filters: list[str] | None,
+    graph_path: str | None,
+    given: bool = False,
+    unresolved: list[str] | None = None,
+) -> str:
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
     traversal_graph = _filter_graph_by_context(_traversal_view(G), resolved_filters)
     nodes, edges = _dfs(traversal_graph, start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, start_nodes, depth)
     header_parts = [
         f"Traversal: {mode.upper()} depth={depth}",
-        f"Start: {[G.nodes[n].get('label', n) for n in start_nodes]}",
+        f"Start{' (given)' if given else ''}: {[G.nodes[n].get('label', n) for n in start_nodes]}",
     ]
+    if unresolved:
+        header_parts.append(f"Unresolved seeds (skipped): {unresolved}")
     # Name the graph this answer came from. `graphify-out/` resolves against the
     # CWD, so running a query from a parent project while thinking about a
     # vendored subproject silently answers from the wrong corpus — the output is
@@ -1539,6 +1582,23 @@ def _label_has_literal_exact_match(G: nx.Graph, term: str, norm_query: str) -> b
     return False
 
 
+# `pkg.mod.func`, `pkg.mod.func()` or `pkg.mod:func` (#4366).
+_PY_QUALIFIED_RE = re.compile(r"^([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)[.:]([A-Za-z_]\w*)(?:\(\))?$")
+
+
+def _resolve_python_qualified(G: nx.Graph, label: str) -> list[str]:
+    """Nodes named by a dotted Python symbol such as `pkg.mod.func` (#4366)."""
+    qualified = _PY_QUALIFIED_RE.match(label.strip())
+    if not qualified:
+        return []
+    module_path = qualified.group(1).replace(".", "/")
+    for path_part in (f"{module_path}.py", f"{module_path}/__init__.py"):
+        scoped = _resolve_path_scoped_symbol(G, path_part, qualified.group(2))
+        if scoped:
+            return scoped
+    return []
+
+
 def _find_node_tiers(
     G: nx.Graph, label: str
 ) -> tuple[list[str], list[str], list[str], list[str]]:
@@ -1579,6 +1639,16 @@ def _find_node_tiers(
             scoped = _resolve_path_scoped_symbol(G, path_part, symbol_part)
             if scoped:
                 return scoped, [], [], []
+
+    # A dotted Python symbol (`pkg.mod.func`, or the `pkg.mod:func` entry-point
+    # form) names a module path plus a symbol. Tokenized as-is it matches no
+    # label, so map it onto the `path::symbol` lookup above: `pkg/mod.py` (or
+    # `pkg/mod/__init__.py`), suffix-matched so a `src/` layout still resolves
+    # (#4366). Nothing found falls through to the ordinary tiers.
+    if _PY_QUALIFIED_RE.match(label.strip()) and not _label_has_literal_exact_match(G, term, norm_query):
+        scoped = _resolve_python_qualified(G, label)
+        if scoped:
+            return scoped, [], [], []
 
     if not term:
         return [], [], [], []
@@ -1710,6 +1780,10 @@ def _tier_refusal(G: nx.Graph, label: str, tier: list[str], *, file_query: bool)
     rivals = _rivals_across_files(G, tier)
     if rivals:
         return _ambiguity_message(G, label, rivals)
+    # A dotted Python symbol's tier is symbols, not a file followed by its
+    # members, so a function and a same-named method in one module tie (#4366).
+    if file_query and len(tier) > 1 and tier == _resolve_python_qualified(G, label):
+        file_query = False
     if len(tier) > 1 and not file_query:
         return _same_file_ambiguity_message(G, label, tier)
     return None
