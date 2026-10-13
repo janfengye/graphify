@@ -4230,7 +4230,9 @@ def _merge_csharp_partial_class_nodes(
     onto it. Member node ids are left untouched — only the class-level nodes
     collapse.
 
-    Must run BEFORE _disambiguate_colliding_node_ids / _rewire_unique_stub_nodes /
+    Must run AFTER _disambiguate_colliding_node_ids (so a half whose id collides
+    with another file's node is already salted apart, and every edge still sits
+    on its own half when it is rewired) and BEFORE _rewire_unique_stub_nodes /
     _resolve_csharp_type_references and the resolver registry, so every later
     pass sees one definition per partial type.
     """
@@ -4962,7 +4964,7 @@ def _resolve_python_member_calls(
             # receiver also matches the local alias bound on that import edge
             # (#2082), so an aliased import resolves the same as the bare name.
             rkey = _key(receiver)
-            caller_file = file_of_node.get(caller)
+            caller_file = _file_node(caller)
             file_aliases = import_alias_by_filenode.get(caller_file, {})
             mods = [t for t in imported_by_filenode.get(caller_file, ())
                     if t in contains_children
@@ -5365,7 +5367,10 @@ def _resolve_csharp_member_calls(
     Must run after id-disambiguation so node ids and caller_nids are final.
     """
     def _key(label: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
+        # Case and `_` are part of a C# name: `Put` and `_Put` are two
+        # methods, so `this.Put()` must not bind to `_Put` (#4415). Only the
+        # label decoration (`.Put()`) goes.
+        return re.sub(r"\W+", "", str(label))
 
     contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
 
@@ -9858,8 +9863,16 @@ def extract(
     _repoint_python_package_imports(paths, all_nodes, all_edges, root)
     _repoint_python_sibling_imports(paths, all_nodes, all_edges, root)
     _merge_swift_extensions(per_file, all_nodes, all_edges)
-    _merge_csharp_partial_class_nodes(per_file, all_nodes, all_edges, paths, root)
+    # Salt colliding ids apart BEFORE the C# partial merge. The merge rewires the
+    # edges of every half onto the canonical half's id; if that id collides with
+    # another file's node (`Spec.cs` next to `_Spec.cs`, `Cfg/Helpers.cs` next to
+    # `Cfg_Helpers.cs`), the disambiguation would look those rewired edges up by
+    # their own source_file, i.e. the file of the half they came from, not of the
+    # canonical half; it would miss and leave them on a dead id. Run first, it
+    # splits only genuinely distinct nodes; the merge then joins the halves by
+    # type path, whatever their (salted) ids.
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
+    _merge_csharp_partial_class_nodes(per_file, all_nodes, all_edges, paths, root)
     _canonicalize_csharp_namespace_nodes(all_nodes, all_edges)
     # PHP namespace/use disambiguation must run BEFORE the unique-stub rewire:
     # the false merge (#1923) happens inside the rewire when a bare-name stub
@@ -10164,6 +10177,7 @@ def extract(
             )
     _csharp_stub_resolver: CsharpNameResolver | None = None  # built on first use
     _csharp_method_owner: dict[str, str] | None = None  # method nid -> type nid, built on first use
+    _csharp_outer_type: dict[str, str] | None = None  # nested type nid -> outer type label, built on first use
     for rc in all_raw_calls:
         if rc.get("_ambiguous_python_import"):
             continue
@@ -10220,6 +10234,16 @@ def extract(
             # #4245) bound to the case instead of getting no edge/deferring to
             # raw_calls resolution that could reject it on its own grounds.
             candidates = [c for c in candidates if c not in _member_nids]
+            if rc.get("csharp_new"):
+                # Nor does `new X()` construct a method that shares X's name:
+                # without this every `new List<T>()` in the corpus binds to a
+                # `List()` method as an INFERRED hub.
+                if _csharp_method_owner is None:
+                    _csharp_method_owner = {
+                        e["target"]: e["source"] for e in all_edges
+                        if e.get("relation") == "method"
+                    }
+                candidates = [c for c in candidates if c not in _csharp_method_owner]
             if not candidates:
                 continue
         # A call rescued from an annotation stub (#3888): the caller's own file
@@ -10367,13 +10391,31 @@ def extract(
                     # tie-breakers (non-test preference, then path proximity).
                     # Resolve only if exactly one candidate survives; otherwise
                     # the #543/#1219 guard still holds and we skip.
-                    tgt = disambiguate_ambiguous_candidates(
-                        candidates,
-                        {c: nid_to_source_file.get(c, "") for c in candidates},
-                        rc.get("source_file", ""),
-                    )
-                    if tgt is None:
-                        continue
+                    # A qualified C# construction (`new Outer.Slot()`) names
+                    # which Slot it means, and a proximity guess over the bare
+                    # name ignores that: it takes the one Slot nested in a type
+                    # called Outer, or no edge. A namespace qualifier matches no
+                    # outer type and is left to _resolve_csharp_qualified_calls.
+                    if rc.get("csharp_new") and rc.get("qualified_prefix"):
+                        if _csharp_outer_type is None:
+                            labels = {n["id"]: str(n.get("label", "")) for n in all_nodes}
+                            _csharp_outer_type = {
+                                e["target"]: labels.get(e["source"], "")
+                                for e in all_edges if e.get("relation") == "contains"
+                            }
+                        outer = str(rc["qualified_prefix"]).rsplit(".", 1)[-1]
+                        nested = [c for c in candidates if _csharp_outer_type.get(c) == outer]
+                        if len(nested) != 1:
+                            continue
+                        tgt = nested[0]
+                    else:
+                        tgt = disambiguate_ambiguous_candidates(
+                            candidates,
+                            {c: nid_to_source_file.get(c, "") for c in candidates},
+                            rc.get("source_file", ""),
+                        )
+                        if tgt is None:
+                            continue
                     has_import_evidence = False
         # A source-less candidate is an unresolved external stub, not a
         # project-defined callable. It can remain a target of type/reference
